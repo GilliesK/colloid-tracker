@@ -130,9 +130,10 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QObject, QThread, pyqtSignal, QTimer, QSettings, QByteArray,
-    QSize, QRect, QEvent,
+    QSize, QRect, QEvent, QPointF,
 )
-from PyQt6.QtGui import QImage, QPixmap, QColor, QAction, QIcon, QFont, QPainter
+from PyQt6.QtGui import (QImage, QPixmap, QColor, QAction, QIcon, QFont,
+                         QPainter, QPen, QPolygonF)
 
 try:
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget as _QOpenGLWidget
@@ -2220,14 +2221,22 @@ def _flag_events(trk, s, e, H, W, edge, thresh=5):
 # Annotation engine  (unchanged from v1)
 # ════════════════════════════════════════════════════════════════════
 
-def annotate(raw, result, layer, flag_events, fr):
+def annotate(raw, result, layer, flag_events, fr, scale: float = 1.0):
+    """Draw structural overlays on `raw`.
+
+    scale: when `raw` is a downscaled copy of the analyzed frame (playback
+    fast path), all particle/boundary/flag coordinates and the circle radius
+    are multiplied by this factor so overlays land on the right pixels.
+    Default 1.0 == exact previous behaviour (export/pause paths).
+    """
     out = raw.copy()
     if result is None: return out
-    pts=result.pts_px; coord=result.coord; r=layer.radius
+    pts=result.pts_px; coord=result.coord
+    r = layer.radius if scale == 1.0 else max(1, int(round(layer.radius * scale)))
     # Round every position once (np.rint == round-half-even, same as the
     # previous per-coordinate int(round(...))) — avoids thousands of numpy
     # scalar extractions per frame in the loops below (~2x annotate()).
-    ip   = np.rint(pts).astype(np.int32)
+    ip   = np.rint(pts if scale == 1.0 else pts * scale).astype(np.int32)
     ipts = list(map(tuple, ip.tolist()))
 
     if layer.show_bonds and result.edges is not None:
@@ -2242,11 +2251,11 @@ def annotate(raw, result, layer, flag_events, fr):
         if is_l and not layer.show_lagb: continue
         if not is_l and not layer.show_hagb: continue
         clr=layer.col_lagb if is_l else layer.col_hagb
-        cv2.line(out,(int(round(gb["p1"][0])),int(round(gb["p1"][1]))),
-                 (int(round(gb["p2"][0])),int(round(gb["p2"][1]))),
+        cv2.line(out,(int(round(gb["p1"][0]*scale)),int(round(gb["p1"][1]*scale))),
+                 (int(round(gb["p2"][0]*scale)),int(round(gb["p2"][1]*scale))),
                  clr,layer.gb_thick,cv2.LINE_AA)
-        mx=int(round(0.5*(gb["p1"][0]+gb["p2"][0])))
-        my=int(round(0.5*(gb["p1"][1]+gb["p2"][1])))
+        mx=int(round(0.5*(gb["p1"][0]+gb["p2"][0])*scale))
+        my=int(round(0.5*(gb["p1"][1]+gb["p2"][1])*scale))
         cv2.putText(out,f"{gb['misorientation_deg']:.1f}°",(mx+4,my-4),
                     cv2.FONT_HERSHEY_SIMPLEX,0.38,clr,1,cv2.LINE_AA)
 
@@ -2265,10 +2274,11 @@ def annotate(raw, result, layer, flag_events, fr):
     if layer.show_flags:
         for ev in flag_events:
             if abs(ev.frame-fr)<=layer.flag_frames:
-                cv2.circle(out,(int(round(ev.x_px)),int(round(ev.y_px))),
+                ex, ey = int(round(ev.x_px*scale)), int(round(ev.y_px*scale))
+                cv2.circle(out,(ex,ey),
                            r+6,layer.col_flags,layer.flag_thick,cv2.LINE_AA)
                 cv2.putText(out,"▲" if ev.kind=="appeared" else "▼",
-                            (int(round(ev.x_px))+r+4,int(round(ev.y_px))+4),
+                            (ex+r+4,ey+4),
                             cv2.FONT_HERSHEY_SIMPLEX,0.5,layer.col_flags,1,cv2.LINE_AA)
 
     if layer.show_hud:
@@ -2307,13 +2317,73 @@ class FrameGLWidget(_GL_WIDGET_BASE):
     copies reduced to one DMA upload).
     """
 
+    # Emitted when a freehand ROI lasso is completed: list[(x, y)] in FRAME
+    # pixel coordinates (>= 3 vertices, clamped to the frame).
+    roi_drawn = pyqtSignal(object)
+
     def __init__(self, placeholder: str = "", parent=None):
         super().__init__(parent)
         self._image: QImage | None = None
         self._buf = None          # keep numpy array alive while QImage references it
         self._placeholder = placeholder
+        self._roi_draw = False    # lasso-draw mode (VideoPane ROI button)
+        self._draw_pts: list = [] # in-progress lasso, widget coordinates
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(200, 150)
+
+    # ── ROI lasso drawing ────────────────────────────────────────────
+    def set_roi_draw_mode(self, on: bool):
+        self._roi_draw = bool(on)
+        self._draw_pts = []
+        self.setCursor(Qt.CursorShape.CrossCursor if on
+                       else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def _fit_geometry(self):
+        """(scale, ox, oy) of the letterboxed frame inside the widget —
+        mirrors the math in _paint(). None if no frame is shown."""
+        if self._image is None:
+            return None
+        iw, ih = self._image.width(), self._image.height()
+        rw, rh = self.rect().width(), self.rect().height()
+        if iw <= 0 or ih <= 0 or rw <= 0 or rh <= 0:
+            return None
+        scale = min(rw / iw, rh / ih)
+        return scale, (rw - int(iw * scale)) // 2, (rh - int(ih * scale)) // 2
+
+    def mousePressEvent(self, ev):
+        if self._roi_draw and ev.button() == Qt.MouseButton.LeftButton \
+                and self._image is not None:
+            self._draw_pts = [ev.position()]
+            self.update()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._roi_draw and self._draw_pts:
+            p = ev.position()
+            last = self._draw_pts[-1]
+            if abs(p.x() - last.x()) + abs(p.y() - last.y()) >= 2.0:
+                self._draw_pts.append(p)
+                self.update()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._roi_draw and self._draw_pts \
+                and ev.button() == Qt.MouseButton.LeftButton:
+            geo = self._fit_geometry()
+            pts = self._draw_pts; self._draw_pts = []
+            if geo is not None and len(pts) >= 3:
+                scale, ox, oy = geo
+                iw, ih = self._image.width(), self._image.height()
+                frame_pts = [(min(max((p.x() - ox) / scale, 0.0), iw - 1.0),
+                              min(max((p.y() - oy) / scale, 0.0), ih - 1.0))
+                             for p in pts]
+                self.roi_drawn.emit(frame_pts)
+            self.update()
+            return
+        super().mouseReleaseEvent(ev)
 
     def set_frame(self, bgr: np.ndarray):
         """Wrap bgr array as a QImage (zero-copy when Format_BGR888 available)
@@ -2358,6 +2428,11 @@ class FrameGLWidget(_GL_WIDGET_BASE):
                 oy    = (rh - dh) // 2
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
                 painter.drawImage(QRect(ox, oy, dw, dh), self._image)
+        # In-progress ROI lasso feedback (widget coordinates)
+        if self._draw_pts and len(self._draw_pts) >= 2:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor(255, 220, 40), 2))
+            painter.drawPolyline(QPolygonF(self._draw_pts))
         painter.end()
 
     # QOpenGLWidget calls paintGL; plain QWidget calls paintEvent.
@@ -2372,21 +2447,6 @@ class FrameGLWidget(_GL_WIDGET_BASE):
 # ════════════════════════════════════════════════════════════════════
 # Workers  (unchanged from v1, CameraWorker updated for camera index)
 # ════════════════════════════════════════════════════════════════════
-
-def _effective_max_neighbor_um(p: dict) -> float:
-    """Structural neighbor-distance cutoff in µm.
-
-    An explicit user value (>0) wins. When the parameter is 0 ("auto"), the
-    cutoff defaults to 3× the particle radius (= 1.5× the detection diameter):
-    particles farther apart than that are never physical neighbors, so ψ₆ /
-    coordination / grain-boundary / cage analyses must not link them."""
-    v = float(p.get("max_neighbor_dist_um", 0.0) or 0.0)
-    if v > 0:
-        return v
-    diam_px = float(p.get("diameter", 15))
-    px_um   = float(p.get("px_um", 0.11))
-    return 1.5 * diam_px * px_um
-
 
 class TrackingWorker(QThread):
     progress   = pyqtSignal(int, str)
@@ -2417,6 +2477,14 @@ class TrackingWorker(QThread):
             if not ok: raise RuntimeError("Cannot read first frame from video.")
             data.H, data.W = _fr0.shape[:2]
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+            # User-drawn analysis region: detection is restricted to inside
+            # this polygon (via _fast_locate's search_mask), which confines
+            # everything downstream — linking, ψ₆, g(r) — to the region.
+            _roi_mask = _roi_mask_from_polygon(p.get("roi_polygon"), data.H, data.W)
+            if _roi_mask is not None:
+                pct_area = 100.0 * _roi_mask.mean()
+                self.progress.emit(2, f"Analysis region: {pct_area:.0f}% of frame")
 
             data.start_fr = int(p.get("start_fr", 0))
             data.end_fr   = min(int(p["end_fr"]) if int(p.get("end_fr", 0)) > 0 else N - 1, N - 1)
@@ -2545,6 +2613,10 @@ class TrackingWorker(QThread):
                                 # pass would have provided; worst case, this
                                 # frame is no faster than the baseline.
                                 search_mask = mask
+
+                if _roi_mask is not None:
+                    search_mask = _roi_mask if search_mask is None \
+                        else (search_mask & _roi_mask)
 
                 feats = _fast_locate(proc, diameter=diam, separation=sep,
                                     minmass=(0.0 if _dark else _mm),
@@ -2697,7 +2769,7 @@ class TrackingWorker(QThread):
 
             dp={k:p[k] for k in("pair_dist_px","lagb_eps_px","lagb_min_n","lagb_aspect","lagb_angle_deg")}
             dp["px_um"] = p.get("px_um", 0.11)
-            dp["max_neighbor_dist_um"] = _effective_max_neighbor_um(p)
+            dp["max_neighbor_dist_um"] = p.get("max_neighbor_dist_um", 0.0)
             nfr=e-s+1
 
             # Build per-frame pts dict once — O(N), avoids O(F·N) repeated scans.
@@ -2844,7 +2916,7 @@ class TrackingWorker(QThread):
             if _ana_aborted.is_set() or self._abort:
                 self.error.emit("Aborted."); return
 
-            data.tracks=_cage(data.tracks, max_neighbor_dist_um=_effective_max_neighbor_um(p))
+            data.tracks=_cage(data.tracks, max_neighbor_dist_um=p.get("max_neighbor_dist_um", 0.0))
             data.flag_events=_flag_events(data.tracks,s,e,data.H,data.W,edge,int(p.get("appear_thresh",5)))
             self.progress.emit(62,f"{len(data.flag_events)} flag events")
 
@@ -2884,13 +2956,16 @@ class PreviewWorker(QThread):
                                  flatten_illum=bool(p.get("flatten_illum",False)),
                                  flatten_sigma_frac=p.get("flatten_sigma_frac",0.15))
                 if p.get("ring_mode",False): proc=_ring_to_spot(proc,diam)
+            roi_mask=_roi_mask_from_polygon(p.get("roi_polygon"),
+                                            proc.shape[0], proc.shape[1])
             feats=_fast_locate(proc,diameter=diam,separation=int(p["separation"]),
                                minmass=(0.0 if dark else float(p["minmass"])),
                                percentile=int(p["percentile"]),
                                invert=False,
                                ecc_max=(p.get("ecc_max",0.8) if p.get("use_ecc_filter",False) else None),
                                reject_size_outliers=bool(p.get("reject_size_outliers",False)),
-                               size_outlier_mad_mult=p.get("size_outlier_mad_mult",2.5))
+                               size_outlier_mad_mult=p.get("size_outlier_mad_mult",2.5),
+                               search_mask=roi_mask)
             if dark: feats=_dark_disk_minmass_filter(feats)
             if feats is None or feats.empty or len(feats)<4: self.done.emit(None); return
             # Emit feats with x_px/y_px aliases for DiagnosticsPanel
@@ -2900,7 +2975,7 @@ class PreviewWorker(QThread):
             pts=feats[["x","y"]].values
             dp={k:p[k] for k in("pair_dist_px","lagb_eps_px","lagb_min_n","lagb_aspect","lagb_angle_deg")}
             dp["px_um"] = p.get("px_um", 0.11)
-            dp["max_neighbor_dist_um"] = _effective_max_neighbor_um(p)
+            dp["max_neighbor_dist_um"] = p.get("max_neighbor_dist_um", 0.0)
             self.done.emit(analyze_frame(pts,dp))
         except Exception as exc: self.error.emit(str(exc))
 
@@ -3832,7 +3907,7 @@ class AnalysisWorker(QThread):
                     # frame's pixel space, so divide by cam_scale to convert
                     # µm -> px consistently in analyze_frame.
                     "px_um":         p.get("px_um", 0.11) / max(cam_scale, 1e-9),
-                    "max_neighbor_dist_um": _effective_max_neighbor_um(p),
+                    "max_neighbor_dist_um": p.get("max_neighbor_dist_um", 0.0),
                 }
                 res = analyze_frame(pts, dp)
                 ann = annotate(bgr, res, layer, [], 0)
@@ -4240,8 +4315,7 @@ class ParamPanel(QScrollArea):
                    "boundaries, cage-relative coordinates). Delaunay triangulation and\n"
                    "k-nearest-neighbour queries both create long, physically-meaningless\n"
                    "edges at cluster boundaries or in dilute regions — this filters them\n"
-                   "out after the fact. 0 = auto: 3× the particle radius\n"
-                   "(1.5 × detection diameter × µm/px).")
+                   "out after the fact. 0 = disabled (no cutoff, legacy behaviour).")
         root.addWidget(g3)
 
         # ── Structural correlations: g(r) / g6(r) ───────────────────────
@@ -5342,6 +5416,16 @@ class DiagnosticsPanel(QWidget):
 # Video pane  (updated: preview + params passed externally)
 # ════════════════════════════════════════════════════════════════════
 
+def _roi_mask_from_polygon(poly, H: int, W: int) -> "np.ndarray | None":
+    """Boolean HxW mask from a user-drawn ROI polygon ([[x, y], ...] in frame
+    px). None when no usable polygon — callers then search the full frame."""
+    if not poly or len(poly) < 3:
+        return None
+    m = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(m, [np.rint(np.asarray(poly, dtype=np.float64)).astype(np.int32)], 1)
+    return m.astype(bool)
+
+
 def _enhance_for_display(bgr: np.ndarray, params: dict) -> np.ndarray:
     """Cosmetic enhancement (gamma/sharpen/denoise/flatten) for human viewing.
 
@@ -5386,6 +5470,79 @@ def _enhance_for_display(bgr: np.ndarray, params: dict) -> np.ndarray:
     return cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
 
 
+class _PlaybackPrefetcher:
+    """Background sequential decoder for smooth playback.
+
+    Decoding a 2840² H.264 frame costs 15-40+ ms; doing it on the GUI thread
+    put a hard ~10-25 fps ceiling on playback regardless of the frame-drop
+    scheduler. This owns its OWN VideoCapture (so the pane's main capture
+    keeps its seek bookkeeping for paused stepping/preview) and decodes ahead
+    into a small bounded deque; the GUI thread pops the newest frame at or
+    below its wall-clock target, dropping intermediates for free."""
+
+    def __init__(self, path: str, start_fr: int, maxq: int = 4):
+        self._cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+        if start_fr > 0:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, start_fr)
+        self._next_fr = int(start_fr)
+        self._buf: _deque = _deque()
+        self._maxq = maxq
+        self._lock = threading.Lock()
+        self._space = threading.Event(); self._space.set()
+        self._stop_flag = False
+        self.eof = False
+        # Clock-target hint from the GUI (plain int write = atomic). When the
+        # decoder is behind it, frames are discarded with grab() — decode
+        # without the retrieve/convert/copy — which is substantially cheaper
+        # than read(), so the timeline can hold native rate by dropping
+        # harder instead of slipping.
+        self.target: int = int(start_fr)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop_flag:
+            if self._next_fr < self.target:
+                if not self._cap.grab():
+                    self.eof = True
+                    break
+                self._next_fr += 1
+                continue
+            if not self._space.wait(timeout=0.1):
+                continue
+            if self._stop_flag:
+                break
+            ok, f = self._cap.read()
+            if not ok:
+                self.eof = True
+                break
+            if f.ndim == 2:
+                f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
+            with self._lock:
+                self._buf.append((self._next_fr, f))
+                self._next_fr += 1
+                if len(self._buf) >= self._maxq:
+                    self._space.clear()
+        try: self._cap.release()
+        except Exception: pass
+
+    def pop_upto(self, target_fr: int):
+        """Newest buffered (fr, bgr) with fr <= target_fr; older ones dropped.
+        None if the decoder hasn't reached target_fr yet."""
+        item = None
+        with self._lock:
+            while self._buf and self._buf[0][0] <= target_fr:
+                item = self._buf.popleft()
+            if len(self._buf) < self._maxq:
+                self._space.set()
+        return item
+
+    def stop(self):
+        self._stop_flag = True
+        self._space.set()
+        self._thread.join(timeout=1.0)
+
+
 class VideoPane(QWidget):
     frame_changed        = pyqtSignal(int)
     grain_size_suggested = pyqtSignal(int)
@@ -5412,6 +5569,9 @@ class VideoPane(QWidget):
         self._preview_raw   = None   # raw frame backing _preview_feats (avoids a 2nd re-read)
         self._cap_pos      = -1      # track cap read position to skip redundant seeks
         self._raw_cache    = None    # 1-slot: ((fr, vpath, enh_key), enhanced_bgr)
+        self._prefetcher: "_PlaybackPrefetcher | None" = None
+        self._roi_poly: "np.ndarray | None" = None   # (N,2) float32, frame px
+        self._roi_token    = 0       # bumped on ROI change (cache invalidation)
         self._timer=QTimer(self); self._timer.timeout.connect(self._tick)
         self._build()
 
@@ -5453,6 +5613,18 @@ class VideoPane(QWidget):
         self.btn_hide_raw.setCheckable(True)
         self.btn_hide_raw.setToolTip("Hide the unannotated raw video panel")
         self.btn_hide_raw.toggled.connect(self._on_hide_raw_toggle)
+        self.btn_roi=QPushButton("✎ ROI"); self.btn_roi.setCheckable(True)
+        self.btn_roi.setFixedWidth(60)
+        self.btn_roi.setToolTip(
+            "Draw the region you want analyzed: click, then drag a freehand\n"
+            "outline on the ANNOTATED panel and release to close it.\n"
+            "Preview and Track & Analyse will only detect particles inside.\n"
+            "Drawing again replaces the region; ✕ clears it.")
+        self.btn_roi.toggled.connect(self._on_roi_toggle)
+        self.btn_roi_clear=QPushButton("✕"); self.btn_roi_clear.setFixedWidth(24)
+        self.btn_roi_clear.setToolTip("Clear the analysis region (analyze the full frame)")
+        self.btn_roi_clear.setEnabled(False)
+        self.btn_roi_clear.clicked.connect(self._on_roi_clear)
         self.lbl_info=QLabel("—")
         # Playback speed multiplier — playback always targets the video's own
         # fps (read from CAP_PROP_FPS at load); this only scales that rate.
@@ -5463,10 +5635,13 @@ class VideoPane(QWidget):
         self.cmb_speed.setToolTip("Playback speed relative to the video's native frame rate")
         self.cmb_speed.currentIndexChanged.connect(self._on_speed_changed)
         for w in(self.btn_p,self.btn_play,self.btn_n,self.btn_prev,
-                 self.btn_ecc,self.btn_link,self.btn_grain,self.btn_hide_raw,self.lbl_info,self.cmb_speed): ctrl.addWidget(w)
+                 self.btn_ecc,self.btn_link,self.btn_grain,self.btn_hide_raw,
+                 self.btn_roi,self.btn_roi_clear,self.lbl_info,self.cmb_speed): ctrl.addWidget(w)
         ctrl.addStretch(); lay.addLayout(ctrl)
+        self.lbl_ann.roi_drawn.connect(self._on_roi_drawn)
 
     def load_video(self, path):
+        self._stop_prefetch()
         if self._cap: self._cap.release()
         self._cap   = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
         self._total = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -5542,34 +5717,70 @@ class VideoPane(QWidget):
         fr=max(self.slider.minimum(),min(self.slider.maximum(),fr))
         self._fr=fr; self.slider.blockSignals(True); self.slider.setValue(fr); self.slider.blockSignals(False)
         self._render(fr); self.frame_changed.emit(fr)
+        if self._playing:
+            # Manual seek during playback — re-anchor clock + restart decoder
+            self._play_t0  = time.perf_counter()
+            self._play_fr0 = fr
+            self._start_prefetch()
 
     def _play_fps(self) -> float:
         mult = self.cmb_speed.currentData()
         return max(0.5, self._native_fps * float(mult if mult else 1.0))
 
+    def _start_prefetch(self):
+        self._stop_prefetch()
+        if self._vpath:
+            self._prefetcher = _PlaybackPrefetcher(self._vpath, self._fr + 1)
+
+    def _stop_prefetch(self):
+        if self._prefetcher is not None:
+            self._prefetcher.stop()
+            self._prefetcher = None
+
     def _tick(self):
         # Wall-clock scheduling: advance to the frame the clock says we should
-        # be on. If rendering is slower than the frame period, intermediate
-        # frames are dropped so playback stays at the video's real rate
-        # instead of slowing down.
+        # be on. The prefetcher decodes ahead on its own thread; we pop the
+        # newest frame at/below the clock target (intermediates drop for
+        # free), so GUI-thread work per tick is just resize+annotate+upload.
         fps    = self._play_fps()
         target = self._play_fr0 + int((time.perf_counter() - self._play_t0) * fps)
+        target = min(target, self.slider.maximum())
         if target <= self._fr:
             return
-        self.goto(min(target, self.slider.maximum()))
-        if self._fr>=self.slider.maximum(): self._playing=False; self.btn_play.setChecked(False)
+        pf = self._prefetcher
+        if pf is None:
+            self.goto(target)                     # fallback: synchronous path
+        else:
+            pf.target = target                    # let the decoder skip-ahead
+            item = pf.pop_upto(target)
+            if item is None:
+                if pf.eof:
+                    self._playing=False; self.btn_play.setChecked(False)
+                return                            # decoder behind clock — wait
+            fr, bgr = item
+            self._fr = fr
+            self.slider.blockSignals(True); self.slider.setValue(fr); self.slider.blockSignals(False)
+            self._render_playback(fr, bgr)
+            self.frame_changed.emit(fr)
+        if self._fr >= self.slider.maximum():
+            self._playing=False; self.btn_play.setChecked(False)
 
     def _on_play(self,on):
         self._playing=on
         if on:
             self._play_t0  = time.perf_counter()
             self._play_fr0 = self._fr
+            self._start_prefetch()
             # Tick at half the frame period (≥4 ms floor) — _tick's clock
             # math decides which frame to show, so a fast timer costs only
             # cheap no-op ticks and never renders more than fps frames/s.
             self._timer.start(max(4, int(500.0 / self._play_fps())))
         else:
             self._timer.stop()
+            self._stop_prefetch()
+            # Playback used the display-resolution fast path — restore the
+            # paused view at full resolution.
+            self._render(self._fr)
 
     def _on_speed_changed(self, _idx):
         if self._playing:
@@ -5578,7 +5789,12 @@ class VideoPane(QWidget):
             self._play_fr0 = self._fr
             self._timer.start(max(4, int(500.0 / self._play_fps())))
 
-    def _on_sl(self,v): self._fr=v; self._render(v); self.frame_changed.emit(v)
+    def _on_sl(self,v):
+        self._fr=v; self._render(v); self.frame_changed.emit(v)
+        if self._playing:
+            self._play_t0  = time.perf_counter()
+            self._play_fr0 = v
+            self._start_prefetch()
 
     def _read_bgr(self,fr):
         """Frame read for detection consumers (PreviewWorker, GrainSizeWorker).
@@ -5610,7 +5826,8 @@ class VideoPane(QWidget):
                  lyr.gb_thick, lyr.flag_thick, lyr.flag_frames,
                  lyr.col_6fold, lyr.col_5fold, lyr.col_7fold)
         cache_key = (fr, id(self._data), _lkey,
-                     self._ecc_overlay, self._link_overlay, self._grain_overlay, r)
+                     self._ecc_overlay, self._link_overlay, self._grain_overlay, r,
+                     self._roi_token)
         hit = override is None and cache_key in self._ann_cache
 
         # Same-frame re-renders (overlay toggles, layer/param changes,
@@ -5663,6 +5880,10 @@ class VideoPane(QWidget):
             # ── ψ₆ grain overlay ──────────────────────────────────
             if self._grain_overlay and self._data and fr in self._data.frame_results:
                 ann = _draw_grain_overlay(ann, self._data.frame_results[fr], radius=r)
+            # Analysis-region overlay: outline + dim outside (paused/stepped
+            # view only — ann here is always a fresh copy, never the raw cache)
+            if self._roi_poly is not None:
+                ann = self._draw_roi_overlay(ann, 1.0, dim_outside=True)
             # Store in bounded cache (evict oldest entry when full)
             if override is None:
                 if len(self._ann_cache) >= self._ANN_CACHE_MAX:
@@ -5671,6 +5892,104 @@ class VideoPane(QWidget):
 
         self.lbl_ann.set_frame(ann)
         self.lbl_info.setText(f"fr {fr}/{self._total-1} @ {self._native_fps:g} fps")
+
+    def _render_playback(self, fr, bgr):
+        """Playback fast path: the frame arrives pre-decoded from the
+        prefetcher and is rendered at DISPLAY resolution — the GL widget
+        scales the full-res frame down to widget size anyway, so enhancing
+        and annotating 8 MP just to show ~1-2 MP was pure waste (measured
+        ~20 ms/frame saved at 2840²). Annotation coordinates are scaled via
+        annotate(scale=...). Pausing re-renders full-res via _render().
+
+        The extra overlays (eccentricity/motion/grains) don't support
+        coordinate scaling, so their presence falls back to full resolution.
+        The annotated-frame cache is skipped: sequential playback never hits
+        it (keys include the frame index)."""
+        h, w = bgr.shape[:2]
+        scale = 1.0
+        if not (self._ecc_overlay or self._link_overlay or self._grain_overlay):
+            try:    dpr = float(self.lbl_ann.devicePixelRatioF())
+            except Exception: dpr = 1.0
+            tw = max(320.0, self.lbl_ann.width()  * dpr)
+            th = max(240.0, self.lbl_ann.height() * dpr)
+            # Fit-inside scale with a little headroom for crisp GL sampling
+            scale = min(1.0, 1.2 * min(tw / w, th / h))
+        if scale < 1.0:
+            disp = cv2.resize(bgr, (max(2, int(w * scale)), max(2, int(h * scale))),
+                              interpolation=cv2.INTER_AREA)
+            scale = disp.shape[1] / w   # exact scale after integer rounding
+        else:
+            disp = bgr
+        disp = self._apply_enhancement_for_display(disp)
+        if not self._hide_raw:
+            self.lbl_raw.set_frame(disp)
+        res  = self._data.frame_results.get(fr) if (self._data and self._data.frame_results) else None
+        fevs = self._data.flag_events if self._data else []
+        if res is not None:
+            ann = annotate(disp, res, self._layer, fevs, fr, scale=scale)
+            _legend(ann, self._layer)
+            if scale == 1.0 and (self._ecc_overlay or self._link_overlay or self._grain_overlay):
+                # Full-res fallback: apply the extra overlays like _render does
+                r = max(4, int(self._params.get("diameter", 19)) // 2 + 3)
+                if self._ecc_overlay and self._data.feats is not None:
+                    feats_fr = self._data.feats[self._data.feats.frame == fr]
+                    if not feats_fr.empty:
+                        ann = _draw_ecc_overlay(ann, feats_fr, radius=r)
+                if self._link_overlay and self._data.tracks is not None:
+                    px_um      = float(self._params.get("px_um", 0.11))
+                    max_step_u = float(self._params.get("max_step_um", 3.0))
+                    ann = _draw_linking_overlay(ann, self._data.tracks, fr,
+                                                max_step_u / max(px_um, 1e-9))
+                if self._grain_overlay:
+                    ann = _draw_grain_overlay(ann, res, radius=r)
+        else:
+            ann = disp
+        if self._roi_poly is not None:
+            # Outline only during playback (dimming costs a full-frame pass).
+            # `ann` is either annotate()'s copy or the transient prefetched
+            # frame — never a cached buffer — so in-place drawing is safe.
+            self._draw_roi_overlay(ann, scale, dim_outside=False)
+        self.lbl_ann.set_frame(ann)
+        self.lbl_info.setText(f"fr {fr}/{self._total-1} @ {self._native_fps:g} fps")
+
+    # ── analysis ROI (freehand lasso) ───────────────────────────────
+    def _on_roi_toggle(self, on: bool):
+        self.lbl_ann.set_roi_draw_mode(on)
+
+    def _on_roi_drawn(self, frame_pts):
+        self._roi_poly = np.asarray(frame_pts, dtype=np.float32)
+        self._roi_token += 1
+        self.btn_roi.setChecked(False)          # one-shot draw
+        self.btn_roi_clear.setEnabled(True)
+        self._ann_cache.clear()
+        self._render(self._fr)
+
+    def _on_roi_clear(self):
+        self._roi_poly = None
+        self._roi_token += 1
+        self.btn_roi_clear.setEnabled(False)
+        self._ann_cache.clear()
+        self._render(self._fr)
+
+    def roi_polygon_list(self):
+        """ROI polygon as a plain list of [x, y] (frame px), or None."""
+        return self._roi_poly.tolist() if self._roi_poly is not None else None
+
+    def _draw_roi_overlay(self, img, scale: float = 1.0, dim_outside: bool = False):
+        """Draw the ROI outline (and optionally dim everything outside) on
+        `img` IN PLACE. Callers must pass a frame they own (not a cached one)."""
+        if self._roi_poly is None:
+            return img
+        poly = np.rint(self._roi_poly * scale).astype(np.int32)
+        if dim_outside:
+            mask = np.zeros(img.shape[:2], np.uint8)
+            cv2.fillPoly(mask, [poly], 255)
+            dimmed = cv2.addWeighted(img, 0.35, np.zeros_like(img), 0.65, 0)
+            inside = mask.astype(bool)
+            dimmed[inside] = img[inside]
+            img[:] = dimmed
+        cv2.polylines(img, [poly], True, (40, 220, 255), 2, cv2.LINE_AA)
+        return img
 
     def _on_ecc_toggle(self, checked: bool):
         self._ecc_overlay = checked; self._render(self._fr)
@@ -5694,7 +6013,9 @@ class VideoPane(QWidget):
         # without a second synchronous seek+decode of the same frame index.
         self._preview_raw = raw
         self.btn_prev.setEnabled(False); self.btn_prev.setText("…")
-        self._prev_w=PreviewWorker(raw,self._params,self)
+        pv_params = dict(self._params)
+        pv_params["roi_polygon"] = self.roi_polygon_list()
+        self._prev_w=PreviewWorker(raw,pv_params,self)
         self._prev_w.done.connect(self._on_preview)
         self._prev_w.feats_ready.connect(self._on_preview_feats)
         self._prev_w.error.connect(lambda _:(self.btn_prev.setEnabled(True),self.btn_prev.setText("Preview frame")))
@@ -6898,6 +7219,8 @@ class MainWindow(QMainWindow):
         if not self._vpath: QMessageBox.warning(self,"No video","Open a video first."); return
         if self._worker and self._worker.isRunning(): return
         params=self.param_panel.get(); params["video_path"]=str(self._vpath)
+        # User-drawn analysis region (None = full frame)
+        params["roi_polygon"]=self.vid_pane.roi_polygon_list()
         self._worker=TrackingWorker(params,self)
         self._worker.progress.connect(self._on_prog)
         self._worker.frame_done.connect(self._on_fr_done)
