@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile *)",
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi *)",
+      "Bash(nvcc --version)",
+      "Bash(pip show *)",
+      "Bash(pip list *)",
+      "Bash(pip freeze *)",
+      "Bash(conda list *)",
+      "Bash(conda info *)",
+      "Bash(conda search *)",
+      "Bash(conda env list)",
+      "Bash(where *)",
+      "Bash(tasklist)",
+      "Bash(winget search *)",
+      "Bash(git --version)",
+      "Bash(cmake --version)",
+      "Bash(ninja --version)"
+    ]
+  }
+}
