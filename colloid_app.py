@@ -7072,6 +7072,7 @@ class MainWindow(QMainWindow):
         fm=mb.addMenu("File")
         self._a_open=_act(fm,"Open video…",self._browse,"Ctrl+O")
         self._a_load_cluster=_act(fm,"Load cluster detections…",self._load_cluster_detections)
+        self._a_export_roi=_act(fm,"Export ROI for cluster…",self._export_roi_for_cluster)
         fm.addSeparator()
         self._a_export=_act(fm,"Export annotated MP4…",self._export)
         self._a_export.setEnabled(False)
@@ -7260,6 +7261,45 @@ class MainWindow(QMainWindow):
         self._progress_dlg.show()
         self._worker.start()
         self.status_bar.showMessage(f"Loading cluster detections from {mp.parent.name}…")
+
+    def _export_roi_for_cluster(self):
+        """File -> Export ROI for cluster…: save the currently drawn freehand ROI
+        to a JSON file the Oscar launcher reads (run_oscar_job.py --roi …). The
+        ROI is session-only (not in saved settings), so it must be exported
+        explicitly to confine a cluster run to the same region as a local one."""
+        poly = self.vid_pane.roi_polygon_list()
+        if not poly:
+            QMessageBox.information(
+                self, "No ROI drawn",
+                "Draw an analysis region first with the “✎ ROI” button on the "
+                "video, then export it."); return
+        # Frame dimensions for a sanity check on the cluster side (the polygon
+        # itself is already in full-resolution frame pixels).
+        W = H = None
+        if self._data is not None:
+            W, H = self._data.W, self._data.H
+        elif self._vpath:
+            try:
+                cap = cv2.VideoCapture(str(self._vpath), cv2.CAP_FFMPEG)
+                W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); cap.release()
+            except Exception:
+                pass
+        start = str(Path(self._vpath).with_suffix(".roi.json")) if self._vpath \
+            else str(Path.cwd() / "roi.json")
+        path, _ = QFileDialog.getSaveFileName(self, "Export ROI for cluster", start,
+                                              "ROI JSON (*.json);;All (*)")
+        if not path:
+            return
+        data = {"roi_polygon": poly, "W": W, "H": H,
+                "video": Path(self._vpath).name if self._vpath else None}
+        try:
+            Path(path).write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            QMessageBox.warning(self, "Export failed", str(exc)); return
+        self.status_bar.showMessage(
+            f"ROI ({len(poly)} points) exported → {Path(path).name}  "
+            f"— pass it to the launcher with  --roi \"{path}\"")
 
     def _stop_tracking(self):
         if self._worker: self._worker.abort()

@@ -95,6 +95,10 @@ def main():
     ap.add_argument("--max-array", type=int, default=1001,
                     help="cluster MaxArraySize (default Slurm value); the run refuses to submit "
                          "more tasks than this — raise --chunk-size instead.")
+    ap.add_argument("--roi", default=None,
+                    help="JSON file with a drawn ROI polygon (from the app's File -> "
+                         "'Export ROI for cluster…'). Confines cluster detection to that region, "
+                         "identical to a local ROI run. Overrides any roi_polygon in --params.")
     args = ap.parse_args()
 
     video = Path(args.video)
@@ -110,6 +114,30 @@ def main():
     params = params.get("params", params)          # accept a full settings file too
 
     n, fps, w, h = probe_video(video)
+
+    # Optional ROI: confine detection to a drawn polygon (session-only in the
+    # app, so it isn't in --params — it's exported separately). The polygon is
+    # in full-resolution frame pixels; the worker builds the same mask the app
+    # would and passes it to _fast_locate, so detection matches a local ROI run.
+    if args.roi:
+        with open(args.roi) as f:
+            roi = json.load(f)
+        poly = roi.get("roi_polygon", roi) if isinstance(roi, dict) else roi
+        if not (isinstance(poly, list) and len(poly) >= 3
+                and all(isinstance(pt, (list, tuple)) and len(pt) == 2 for pt in poly)):
+            sys.exit(f"ERROR: --roi {args.roi} must contain a polygon of >=3 [x,y] points "
+                     f"(a bare list or {{'roi_polygon': [...]}}).")
+        rw = roi.get("W") if isinstance(roi, dict) else None
+        rh = roi.get("H") if isinstance(roi, dict) else None
+        if (rw and rw != w) or (rh and rh != h):
+            sys.exit(f"ERROR: ROI was drawn on a {rw}x{rh} frame but the video is {w}x{h}. "
+                     "Re-export the ROI on this video (the polygon is in frame pixels).")
+        xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
+        if min(xs) < 0 or max(xs) > w or min(ys) < 0 or max(ys) > h:
+            print(f"WARNING: ROI extends outside the {w}x{h} frame — it will be clipped.")
+        params = dict(params, roi_polygon=poly)
+        print(f"roi     : {len(poly)}-point polygon, "
+              f"x {min(xs):.0f}..{max(xs):.0f}  y {min(ys):.0f}..{max(ys):.0f}")
     s = max(0, args.start)
     e = (n - 1) if args.end < 0 else min(args.end, n - 1)
     if s > e:

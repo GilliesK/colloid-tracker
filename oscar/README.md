@@ -72,6 +72,20 @@ python run_oscar_job.py \
     --chunk-size 400 --partition gpu
 ```
 
+**Analysis region (ROI).** To confine the cluster run to a freehand region — the
+same as drawing one locally — draw it in the app with the **✎ ROI** button, then
+**File → Export ROI for cluster…** to save a `*.roi.json`, and pass it:
+
+```bash
+python run_oscar_job.py ... --roi "D:/LAGB/long_run.roi.json"
+```
+
+The ROI is session-only in the app (not in saved settings), which is why it is
+exported separately. The polygon is in full-resolution frame pixels; the worker
+builds the *same* mask the app would and passes it to detection, so a cluster
+ROI run detects exactly the particles a local ROI run would. The launcher checks
+the ROI's frame size against the video and warns if the polygon falls outside it.
+
 It probes the video, stages files, submits the detection array **and a dependent
 merge job**, waits, and downloads `results/<jobname>/{detections.parquet,
 job_meta.json}`.
@@ -129,8 +143,17 @@ Do **not** run `python merge_chunks.py` directly on the login node — submit
 - **Empty frames**: a frame with zero detections isn't an error; `merge_chunks.py`
   reports which frames had none so you can tell that apart from a task that failed
   (check `logs/` on Oscar).
-- **ROI**: if your `params.json` contains a `roi_polygon`, the cluster applies the
-  same analysis region, so detections match a local ROI run.
+- **ROI (analysis region)**: to confine a cluster run to a freehand region, draw
+  it in the app (the “✎ ROI” button), then **File → Export ROI for cluster…** to
+  save `something.roi.json`, and pass it to the launcher:
+  ```
+  python run_oscar_job.py … --roi "D:/LAGB/LAGB_long.roi.json"
+  ```
+  The worker builds the exact same polygon mask the app does (`np.rint`-rounded
+  vertices, verified byte-identical), so cluster detection matches a local ROI
+  run. The ROI is session-only in the app, which is why it exports separately
+  rather than riding along in `--params`. `--roi` overrides any `roi_polygon`
+  already in `--params`; omit it for full-frame detection.
 - **Result format** (`schema_version: 1`): `detections.parquet` columns
   `frame,x,y,mass,ecc,signal` (float32, original-resolution px, 0-based absolute
   frame index); `job_meta.json` carries video name, W/H, fps, the full param dict,

@@ -42,15 +42,13 @@ except Exception as exc:                       # pragma: no cover
 def _roi_mask_from_polygon(poly, H, W):
     """Boolean detection mask from a [[x,y],...] polygon (or None -> full frame).
 
-    Mirrors colloid_app._roi_mask_from_polygon so a job that used a drawn ROI
-    detects exactly the same particles on the cluster as it would locally."""
-    if not poly:
-        return None
-    pts = np.asarray(poly, dtype=np.int32).reshape(-1, 2)
-    if len(pts) < 3:
+    Byte-for-byte identical to colloid_app._roi_mask_from_polygon (rounds float
+    vertices with np.rint, NOT truncation) so a job that used a drawn ROI detects
+    exactly the same particles on the cluster as it would locally."""
+    if not poly or len(poly) < 3:
         return None
     m = np.zeros((H, W), np.uint8)
-    cv2.fillPoly(m, [pts], 1)
+    cv2.fillPoly(m, [np.rint(np.asarray(poly, dtype=np.float64)).astype(np.int32)], 1)
     return m.astype(bool)
 
 
