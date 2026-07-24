@@ -14,7 +14,11 @@ module load cuda 2>/dev/null || true
 # CommandNotFoundError: conda activate).
 module load anaconda3/2023.09-0-aqbc
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate colloid
+conda activate colloidcv
+
+# Ignore ~/.local user-site packages so a stray `pip install --user` (numpy,
+# opencv, ...) can never shadow the env's versions on a compute node.
+export PYTHONNOUSERSITE=1
 
 # Mark the env ready — the jobs fail fast with a clear message if this is not 1.
 COLLOID_ENV_READY=1
