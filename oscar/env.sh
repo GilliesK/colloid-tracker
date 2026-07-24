@@ -1,22 +1,20 @@
 # Shared Oscar environment for the colloid detection + merge jobs.
 #
-# EDIT THIS ONCE. It is sourced by BOTH submit_detect.slurm and merge.slurm (on
-# the compute node), so you configure your Python environment in a single place.
-#
-# Activate the Python env that has: numpy pandas opencv-python(-headless) scipy
-# pyarrow  (and, for GPU detection, cupy matching the cluster CUDA), then set
-# COLLOID_ENV_READY=1 at the bottom.
+# Sourced by BOTH submit_detect.slurm and merge.slurm on the compute node, so
+# the Python environment is configured in this single place. EDIT HERE (the PC
+# copy) — the launcher ships this file to Oscar on every run, so a copy edited
+# inside the job directory would be overwritten.
 
+# GPU runtime for cupy detection (harmless / skipped if the name differs or the
+# task lands on a CPU node).
 module load cuda 2>/dev/null || true
 
-# --- activate your Python env: uncomment/edit ONE of these -------------------
-# conda:
-#   module load miniconda3 && source activate colloid
-# venv:
-#   source "$HOME/envs/colloid/bin/activate"
-# module python + user site-packages already on PYTHONPATH: nothing to do here
-# ----------------------------------------------------------------------------
+# Conda (Brown Oscar). `source .../conda.sh` initialises conda so that
+# `conda activate` works in a NON-interactive job shell (without it you get
+# CommandNotFoundError: conda activate).
+module load anaconda3/2023.09-0-aqbc
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate colloid
 
-# Flip to 1 AFTER the env above is active, so the jobs fail fast with a clear
-# message instead of a cryptic ImportError partway through a compute-node run.
-COLLOID_ENV_READY=0
+# Mark the env ready — the jobs fail fast with a clear message if this is not 1.
+COLLOID_ENV_READY=1
