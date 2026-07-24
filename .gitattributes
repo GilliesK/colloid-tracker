@@ -1,0 +1,6 @@
+# Scripts shipped to and executed on Linux (Brown Oscar) MUST keep LF line
+# endings. This overrides a Windows checkout's core.autocrlf=true, which would
+# otherwise convert them to CRLF and break bash on the cluster (e.g.
+# COLLOID_ENV_READY=1\r != 1, or `conda activate colloid\r` not found).
+*.sh    text eol=lf
+*.slurm text eol=lf
