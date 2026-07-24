@@ -91,9 +91,13 @@ def detect_one_frame(gray32, p, roi_mask, use_gpu):
         if ring:
             proc = CD._ring_to_spot(proc, diam)
 
+    # minmass is the user's hard outlier floor, honored for plain and ring
+    # (ring's plain matched-filter masses are on a normal scale). Only dark-disk
+    # forces 0 (its ^4 response needs the adaptive filter below). Kept identical
+    # to colloid_app.TrackingWorker so cluster detections match a local run.
     feats = CD._fast_locate(
         proc, diameter=diam, separation=sep,
-        minmass=(0.0 if (dark or ring) else float(p["minmass"])),
+        minmass=(0.0 if dark else float(p["minmass"])),
         percentile=int(p["percentile"]), invert=False,
         ecc_max=(p.get("ecc_max", 0.8) if p.get("use_ecc_filter", False) else None),
         reject_size_outliers=bool(p.get("reject_size_outliers", False)),
@@ -101,8 +105,6 @@ def detect_one_frame(gray32, p, roi_mask, use_gpu):
         search_mask=roi_mask)
     if dark:
         feats = CD._dark_disk_minmass_filter(feats)
-    elif ring:
-        feats = CD._ring_minmass_filter(feats)
     return feats
 
 

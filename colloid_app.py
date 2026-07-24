@@ -846,7 +846,7 @@ from colloid_detect import (
     _to_gray, _bp_buf, _fast_bandpass,
     _ring_kernel, _ring_to_spot_gpu, _matched_filter_gpu, _ring_to_spot,
     _dark_disk_kernel, _dark_disk_to_spot,
-    _dark_disk_minmass_filter, _ring_minmass_filter,
+    _dark_disk_minmass_filter,
     _get_gpu_buf, _get_cuda_stream, _bilateral_gpu, _nlm_gpu,
     _gpu_bandpass_dilate_mask, _flatten_illumination,
     _preprocess, _locate_masks, _fast_locate,
@@ -1846,21 +1846,22 @@ class TrackingWorker(QThread):
                     search_mask = _roi_mask if search_mask is None \
                         else (search_mask & _roi_mask)
 
+                # minmass is the user's hard outlier-reject floor and is honored
+                # for plain AND ring detection. Ring runs a plain matched filter,
+                # so its masses are on a normal scale the user can set minmass
+                # against (check the Diagnostics mass histogram — the ring scale
+                # differs from the bandpass scale). Only dark-disk forces 0 here,
+                # because its ^4 response puts masses on a contrast^4 scale where
+                # a fixed floor is meaningless; it uses an adaptive filter below.
                 feats = _fast_locate(proc, diameter=diam, separation=sep,
-                                    minmass=(0.0 if (_dark or _ring) else _mm),
+                                    minmass=(0.0 if _dark else _mm),
                                     percentile=_pct, invert=False,
                                     ecc_max=_ecc_max, reject_size_outliers=_reject_size,
                                     size_outlier_mad_mult=_size_mad,
                                     search_mask=search_mask,
                                     gpu_bandpass=(_ls, _ll) if _gpu_chain_eligible else None)
                 if _dark:
-                    # ^4 response rescales masses — adaptive per-frame minmass
-                    # instead of the user's bandpass-calibrated fixed value.
                     feats = _dark_disk_minmass_filter(feats)
-                elif _ring:
-                    # Ring matched-filter response scales with contrast — same
-                    # adaptive minmass so detection survives a dimming feed.
-                    feats = _ring_minmass_filter(feats)
 
                 if _use_pred and fr >= 0:
                     # Update state for the NEXT frame using THIS frame's own
@@ -2321,7 +2322,7 @@ class PreviewWorker(QThread):
             roi_mask=_roi_mask_from_polygon(p.get("roi_polygon"),
                                             proc.shape[0], proc.shape[1])
             feats=_fast_locate(proc,diameter=diam,separation=int(p["separation"]),
-                               minmass=(0.0 if (dark or _ring) else float(p["minmass"])),
+                               minmass=(0.0 if dark else float(p["minmass"])),
                                percentile=int(p["percentile"]),
                                invert=False,
                                ecc_max=(p.get("ecc_max",0.8) if p.get("use_ecc_filter",False) else None),
@@ -2329,7 +2330,6 @@ class PreviewWorker(QThread):
                                size_outlier_mad_mult=p.get("size_outlier_mad_mult",2.5),
                                search_mask=roi_mask)
             if dark: feats=_dark_disk_minmass_filter(feats)
-            elif _ring: feats=_ring_minmass_filter(feats)
             if feats is None or feats.empty or len(feats)<4: self.done.emit(None); return
             # Emit feats with x_px/y_px aliases for DiagnosticsPanel
             feats_px = feats.copy()
@@ -3277,7 +3277,7 @@ class AnalysisWorker(QThread):
             _ring = bool(p.get("ring_mode", False))
             try:
                 feats = _fast_locate(proc, diameter=diam, separation=sep,
-                                     minmass=(0.0 if (dark or _ring) else float(p.get("minmass", 3000))),
+                                     minmass=(0.0 if dark else float(p.get("minmass", 3000))),
                                      percentile=int(p.get("percentile", 80)),
                                      invert=False,
                                      ecc_max=(p.get("ecc_max", 0.8) if p.get("use_ecc_filter", False) else None),
@@ -3285,8 +3285,6 @@ class AnalysisWorker(QThread):
                                      size_outlier_mad_mult=p.get("size_outlier_mad_mult", 2.5))
                 if dark:
                     feats = _dark_disk_minmass_filter(feats)
-                elif _ring:
-                    feats = _ring_minmass_filter(feats)
             except Exception:
                 feats = None
 

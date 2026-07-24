@@ -328,29 +328,6 @@ def _dark_disk_minmass_filter(feats):
     return feats[feats["mass"] >= 0.05 * med].reset_index(drop=True)
 
 
-def _ring_minmass_filter(feats):
-    """Adaptive minmass for ring mode — the fix for 'ring detection dies when
-    the live feed dims'.
-
-    The annular matched-filter response scales with local RING CONTRAST, so a
-    FIXED minmass (the user's value, calibrated at one brightness) silently
-    drops every particle once the feed is a little dimmer than when it was
-    tuned — measured: at 0.5x contrast detection fell from 416 to 25 particles,
-    and to 0 below 0.35x. True ring centres sit far above the residual
-    background response, so keeping candidates above a small fraction of the
-    per-frame median mass is contrast-invariant (422 particles held flat from
-    1.0x down to 0.1x contrast in the same test) while matching the full-
-    contrast quality (frac6 0.71, psi6 0.74). Mirrors _dark_disk_minmass_filter;
-    both matched-filter modes therefore run with minmass=0 at _fast_locate and
-    threshold adaptively here instead."""
-    if feats is None or len(feats) < 8:
-        return feats
-    med = float(feats["mass"].median())
-    if med <= 0:
-        return feats
-    return feats[feats["mass"] >= 0.05 * med].reset_index(drop=True)
-
-
 def _get_gpu_buf(shape: tuple, dtype) -> "cv2.cuda_GpuMat":
     """Return a cached GpuMat for the given shape/dtype, creating one if needed.
     GpuMat objects are reusable: uploading new data into the same object avoids
