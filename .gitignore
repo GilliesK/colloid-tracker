@@ -24,3 +24,6 @@ crash_log.txt*
 # Stray/temp
 %TEMP%/
 *.bak
+
+# Windows shortcuts (machine-local)
+*.lnk

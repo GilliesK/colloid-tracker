@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Local launcher: offload detection of a long video to Brown's Oscar cluster.
+
+Stages the video + shared detection code to Oscar, submits a Slurm GPU array
+(one task per frame chunk), waits for it, merges the chunks, and fetches back a
+compact detections bundle (detections.parquet + job_meta.json). Load that bundle
+in the desktop app via  File -> Load cluster detections…  to get the full
+Video Analysis tab (playback, overlays, g(r)/psi6, LAGB, CSV export) computed
+locally from the cluster-detected coordinates.
+
+Only OpenSSH (ssh/scp, built into Windows 10+/macOS/Linux) and cv2 are needed
+locally. Set up passwordless SSH to Oscar first (ssh-copy-id / an ssh key), or
+you'll be prompted for your password at each step.
+
+Example:
+  python run_oscar_job.py --video "D:/LAGB/run12.mp4" --params params.json \
+      --host ssh.ccv.brown.edu --user YOURID --chunk-size 400
+
+Dry run (stage + print commands, do not submit):
+  python run_oscar_job.py ... --no-submit
+"""
+from __future__ import annotations
+import argparse, json, os, subprocess, sys, time, shlex
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SHIP = ["detect_worker.py", "merge_chunks.py", "submit_detect.slurm"]
+CORE = "colloid_detect.py"          # shared detection core, lives one dir up
+
+
+def sh(cmd, **kw):
+    print("  $", " ".join(shlex.quote(c) for c in cmd))
+    return subprocess.run(cmd, **kw)
+
+
+def ssh(host, user, remote_cmd, capture=False):
+    cmd = ["ssh", f"{user}@{host}", remote_cmd]
+    if capture:
+        r = sh(cmd, capture_output=True, text=True)
+        return r.stdout.strip(), r.returncode
+    return sh(cmd).returncode
+
+
+def scp(src, host, user, dst):
+    # dst is a REMOTE path parsed by the remote shell -> quote it (spaces/meta).
+    return sh(["scp", "-C", str(src), f"{user}@{host}:{shlex.quote(dst)}"]).returncode
+
+
+def scp_from(host, user, remote_path, local_dst):
+    return sh(["scp", "-C", f"{user}@{host}:{shlex.quote(remote_path)}", str(local_dst)]).returncode
+
+
+def probe_video(path):
+    import cv2
+    cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        sys.exit(f"ERROR: cannot open {path}")
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    ok, fr = cap.read()
+    if not ok:
+        sys.exit("ERROR: cannot read first frame")
+    h, w = fr.shape[:2]
+    cap.release()
+    return n, float(fps), int(w), int(h)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--params", required=True,
+                    help="JSON of the detection param dict (export from the app's Save settings, "
+                         "or a saved preset's 'params').")
+    ap.add_argument("--host", default="ssh.ccv.brown.edu")
+    ap.add_argument("--user", required=True)
+    ap.add_argument("--remote-base", default="~/colloid_jobs")
+    ap.add_argument("--jobname", default=None, help="default: video stem + timestamp")
+    ap.add_argument("--chunk-size", type=int, default=400, help="frames per Slurm array task")
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--end", type=int, default=-1, help="-1 = last frame")
+    ap.add_argument("--partition", default="gpu")
+    ap.add_argument("--account", default=None)
+    ap.add_argument("--time", default="02:00:00", help="per-task walltime")
+    ap.add_argument("--results-dir", default=str(HERE / "results"))
+    ap.add_argument("--no-submit", action="store_true", help="stage everything but do not sbatch")
+    ap.add_argument("--poll", type=int, default=30, help="seconds between squeue polls")
+    ap.add_argument("--decode-from-start", action="store_true",
+                    help="force exact sequential frame decode on every task (slower) instead of "
+                         "seek-and-verify. Use if your codec seeks inaccurately.")
+    ap.add_argument("--max-array", type=int, default=1001,
+                    help="cluster MaxArraySize (default Slurm value); the run refuses to submit "
+                         "more tasks than this — raise --chunk-size instead.")
+    args = ap.parse_args()
+
+    video = Path(args.video)
+    if not video.exists():
+        sys.exit(f"ERROR: video not found: {video}")
+    core = HERE.parent / CORE
+    if not core.exists():
+        sys.exit(f"ERROR: {CORE} not found next to the app ({core}). "
+                 "It is created by splitting the detection core out of colloid_app.py — "
+                 "run the desktop app once after updating, or copy it here.")
+    with open(args.params) as f:
+        params = json.load(f)
+    params = params.get("params", params)          # accept a full settings file too
+
+    n, fps, w, h = probe_video(video)
+    s = max(0, args.start)
+    e = (n - 1) if args.end < 0 else min(args.end, n - 1)
+    if s > e:
+        sys.exit(f"ERROR: start ({s}) is past end ({e}); nothing to process.")
+    nchunks = (e - s) // args.chunk_size + 1
+    if nchunks > args.max_array:
+        sys.exit(f"ERROR: {nchunks} array tasks exceeds --max-array ({args.max_array}). "
+                 f"Raise --chunk-size (e.g. {(e - s)//(args.max_array - 1) + 1}) to fit.")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    jobname = args.jobname or f"{video.stem}_{ts}"
+    # Resolve a leading ~ to the remote $HOME so paths can be safely quoted
+    # (a quoted "~/x" is NOT tilde-expanded by the remote shell). One round-trip.
+    remote_base = args.remote_base.rstrip("/")
+    if remote_base.startswith("~"):
+        home, hrc = ssh(args.host, args.user, "printf %s \"$HOME\"", capture=True)
+        if hrc != 0 or not home:
+            sys.exit(f"ERROR: could not resolve remote $HOME on {args.host} "
+                     f"(ssh rc={hrc}). Check connectivity / --user.")
+        remote_base = home + remote_base[1:]
+    remote_dir = f"{remote_base}/{jobname}"
+    # Quote every path interpolated into a REMOTE shell command (ssh string /
+    # scp remote target). Guards against spaces and shell-metacharacter
+    # injection flowing from the video name -> jobname.
+    rq_dir = shlex.quote(remote_dir)
+
+    job = {
+        "video": video.name, "params": params,
+        "n_frames": n, "fps": fps, "W": w, "H": h,
+        "frame_start": s, "frame_end": e,
+        "chunk_size": args.chunk_size, "n_chunks": nchunks,
+        "decode_from_start": bool(args.decode_from_start),
+        "created": ts, "schema_version": 1,
+    }
+    local_job = HERE / f"job_{jobname}.json"
+    local_job.write_text(json.dumps(job, indent=2))
+
+    print(f"\nvideo   : {video.name}  ({w}x{h}, {n} frames, {fps:.2f} fps)")
+    print(f"range   : {s}..{e}  ->  {nchunks} chunks of {args.chunk_size} frames")
+    print(f"oscar   : {args.user}@{args.host}:{remote_dir}")
+    print(f"backend : GPU array on partition '{args.partition}'\n")
+
+    # ---- stage ----
+    print("[1/5] staging files to Oscar")
+    ssh(args.host, args.user, f"mkdir -p {rq_dir}/logs {rq_dir}/chunks")
+    for fn in SHIP:
+        scp(HERE / fn, args.host, args.user, f"{remote_dir}/{fn}")
+    scp(core, args.host, args.user, f"{remote_dir}/{CORE}")
+    scp(local_job, args.host, args.user, f"{remote_dir}/job.json")
+    scp(video, args.host, args.user, f"{remote_dir}/{video.name}")
+
+    dfs = " --decode-from-start" if args.decode_from_start else ""
+    if args.no_submit:
+        print("\n--no-submit: staged only. To run manually on Oscar:")
+        print(f"  ssh {args.user}@{args.host}")
+        print(f"  cd {remote_dir} && mkdir -p logs chunks && "
+              f"sbatch --array=0-{nchunks-1} "
+              f"-p {args.partition} -t {args.time} submit_detect.slurm")
+        return
+
+    # ---- submit ----
+    print("[2/5] submitting Slurm GPU array")
+    acct = f"-A {shlex.quote(args.account)} " if args.account else ""
+    submit = (f"cd {rq_dir} && sbatch --parsable --array=0-{nchunks-1} "
+              f"-p {shlex.quote(args.partition)} -t {shlex.quote(args.time)} "
+              f"{acct}submit_detect.slurm")
+    out, rc = ssh(args.host, args.user, submit, capture=True)
+    if rc != 0 or not out:
+        sys.exit(f"ERROR: sbatch failed (rc={rc}). Output:\n{out}")
+    jobid = out.split(";")[0].split()[-1].strip()
+    print(f"      submitted array job {jobid}")
+
+    # ---- wait ----
+    print("[3/5] waiting for the array to finish (Ctrl-C to detach; results stay on Oscar)")
+    while True:
+        q, _ = ssh(args.host, args.user,
+                   f"squeue -j {shlex.quote(jobid)} -h -o %T 2>/dev/null | sort | uniq -c",
+                   capture=True)
+        if not q.strip():
+            print("      no longer in queue")
+            break
+        print(f"      {time.strftime('%H:%M:%S')}  {q.replace(chr(10), '  ')}")
+        time.sleep(args.poll)
+
+    # An empty queue means the array LEFT the queue — completed OR failed/
+    # cancelled/timed-out. Ask the accounting DB before trusting the result:
+    # a fully-failed array otherwise sails through to merge and produces a
+    # small, real-looking detections.parquet.
+    st, _ = ssh(args.host, args.user,
+                f"sacct -j {shlex.quote(jobid)} -n -X -o State 2>/dev/null | sort | uniq -c",
+                capture=True)
+    print(f"      final task states:\n{st}")
+    bad = [ln for ln in st.splitlines()
+           if any(w in ln for w in ("FAILED", "TIMEOUT", "CANCELLED", "OUT_OF"))]
+    if bad or "COMPLETED" not in st:
+        sys.exit("ERROR: not all array tasks COMPLETED — refusing to merge a partial result.\n"
+                 f"       states:\n{st}\n"
+                 f"       Inspect {remote_dir}/logs on Oscar, fix, and re-run the failed range.")
+
+    # ---- merge ----
+    print("[4/5] merging chunks on Oscar")
+    merge = (f"cd {rq_dir} && python merge_chunks.py --chunks-dir chunks "
+             f"--job job.json --out detections.parquet --meta-out job_meta.json")
+    out, rc = ssh(args.host, args.user, merge, capture=True)
+    print(out)
+    if rc != 0:
+        sys.exit("ERROR: merge failed (incomplete chunks?) — inspect logs on Oscar under "
+                 f"{remote_dir}/logs")
+
+    # ---- fetch ----
+    print("[5/5] fetching results")
+    rdir = Path(args.results_dir) / jobname
+    rdir.mkdir(parents=True, exist_ok=True)
+    for fn in ("detections.parquet", "job_meta.json"):
+        scp_from(args.host, args.user, f"{remote_dir}/{fn}", rdir / fn)
+
+    print(f"\nDONE. Bundle: {rdir}")
+    print("Open the desktop app -> File -> Load cluster detections… and pick "
+          f"{rdir / 'job_meta.json'} (with the original video available locally).")
+
+
+if __name__ == "__main__":
+    main()
