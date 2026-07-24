@@ -27,3 +27,7 @@ crash_log.txt*
 
 # Windows shortcuts (machine-local)
 *.lnk
+
+# Oscar per-run artifacts (written by run_oscar_job.py)
+oscar/job_*.json
+oscar/results/
