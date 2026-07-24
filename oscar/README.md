@@ -26,7 +26,7 @@ same Qt-free core, `colloid_detect.py`.
 | Stage | Where | Code |
 |---|---|---|
 | Preprocess + Crocker–Grier detection (ring / dark / plain) | **Oscar**, GPU array | `detect_worker.py` → `colloid_detect.py` |
-| Merge chunks → one coordinate table | Oscar (or local) | `merge_chunks.py` |
+| Merge chunks → one coordinate table | **Oscar compute node** (dependent Slurm job) | `merge.slurm` → `merge_chunks.py` |
 | Edge filter, linking, ψ₆/g(r)/LAGB, playback | **Local** | the app's existing pipeline |
 
 Only coordinates come back (a few MB), never the video — the app already has it.
@@ -44,11 +44,11 @@ Only coordinates come back (a few MB), never the video — the app already has i
    pip install opencv-python-headless
    pip install cupy-cuda12x        # match `module load cuda` version
    ```
-3. **Point the Slurm script at that env**: edit the marked block in
-   `submit_detect.slurm` (the `module load` / `conda activate` lines) **and set
-   `COLLOID_ENV_READY=1`** in that block — the job fails fast with a clear message
-   if you forget, instead of a cryptic `ImportError`. Set `--partition` /
-   `--account` to what your CCV allocation uses (`sinfo -s` lists partitions;
+3. **Point the jobs at that env**: edit **`env.sh`** (one file, sourced by both
+   the detection and merge jobs) — uncomment your `conda activate` / `venv`
+   line **and set `COLLOID_ENV_READY=1`**. The jobs fail fast with a clear
+   message if you forget, instead of a cryptic `ImportError`. Set `--partition`
+   / `--account` to what your CCV allocation uses (`sinfo -s` lists partitions;
    common GPU names are `gpu`, `gpu-he`).
 
 **Locally** (your PC) you also need `pandas` + **`pyarrow`** — the launcher reads
@@ -72,8 +72,18 @@ python run_oscar_job.py \
     --chunk-size 400 --partition gpu
 ```
 
-It probes the video, stages files, submits `--array=0-(nchunks-1)`, waits, merges,
-and downloads `results/<jobname>/{detections.parquet, job_meta.json}`.
+It probes the video, stages files, submits the detection array **and a dependent
+merge job**, waits, and downloads `results/<jobname>/{detections.parquet,
+job_meta.json}`.
+
+**Nothing non-trivial runs on the login node.** Detection runs in the Slurm
+array; the chunk merge is a *separate Slurm job* gated on the array succeeding
+(`--dependency=afterok`), so even the concatenation happens on a compute node.
+On the login node the launcher only ever calls `sbatch` / `squeue` / `sacct` /
+`mkdir`. If any array task fails, the merge's `afterok` dependency is never
+satisfied and Slurm cancels it — the launcher detects that and reports the
+array failure instead of fetching a partial result. Use `--merge-partition` to
+send the (CPU-only, GPU-free) merge to a batch partition.
 
 - `--no-submit` stages only and prints the exact `sbatch` line (dry run).
 - Ctrl-C during the wait just detaches — the array keeps running on Oscar. To
@@ -100,14 +110,16 @@ Video Analysis tab — playback, overlays, plots, and CSV export all work.
 ## Manual fallback (no launcher)
 
 ```bash
-# on Oscar, in a job dir holding the video, job.json, and the 4 .py/.slurm files:
+# on Oscar, in a job dir holding the video, job.json, and the shipped files:
 mkdir -p logs chunks          # Slurm opens logs/*.out BEFORE the script runs
-sbatch --array=0-32 -p gpu -t 02:00:00 submit_detect.slurm
-# after it finishes (check: sacct -j <jobid> -X -o State):
-python merge_chunks.py --chunks-dir chunks --job job.json \
-       --out detections.parquet --meta-out job_meta.json
-# then scp detections.parquet + job_meta.json back to your PC.
+AID=$(sbatch --parsable --array=0-32 -p gpu -t 02:00:00 submit_detect.slurm)
+# merge runs on a COMPUTE NODE after the array succeeds — never on the login node:
+sbatch --dependency=afterok:$AID -p batch merge.slurm
+# when the merge job COMPLETES (sacct -j <mergeid> -X -o State),
+# scp detections.parquet + job_meta.json back to your PC.
 ```
+Do **not** run `python merge_chunks.py` directly on the login node — submit
+`merge.slurm` (or wrap it in `srun`/`salloc`). The launcher does this for you.
 
 ## Notes & caveats
 

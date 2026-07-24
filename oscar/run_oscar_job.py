@@ -24,7 +24,8 @@ import argparse, json, os, subprocess, sys, time, shlex
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SHIP = ["detect_worker.py", "merge_chunks.py", "submit_detect.slurm"]
+SHIP = ["detect_worker.py", "merge_chunks.py",
+        "submit_detect.slurm", "merge.slurm", "env.sh"]
 CORE = "colloid_detect.py"          # shared detection core, lives one dir up
 
 
@@ -79,7 +80,10 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=400, help="frames per Slurm array task")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=-1, help="-1 = last frame")
-    ap.add_argument("--partition", default="gpu")
+    ap.add_argument("--partition", default="gpu", help="partition for the detection array")
+    ap.add_argument("--merge-partition", default=None,
+                    help="partition for the (CPU-only) merge job; defaults to --partition. "
+                         "Set a CPU/batch partition to avoid holding a GPU for the merge.")
     ap.add_argument("--account", default=None)
     ap.add_argument("--time", default="02:00:00", help="per-task walltime")
     ap.add_argument("--results-dir", default=str(HERE / "results"))
@@ -157,62 +161,77 @@ def main():
     scp(video, args.host, args.user, f"{remote_dir}/{video.name}")
 
     dfs = " --decode-from-start" if args.decode_from_start else ""
+    merge_part = args.merge_partition or args.partition
     if args.no_submit:
-        print("\n--no-submit: staged only. To run manually on Oscar:")
+        print("\n--no-submit: staged only. To run manually on Oscar (all compute on")
+        print("nodes — do NOT run merge_chunks.py on the login node):")
         print(f"  ssh {args.user}@{args.host}")
-        print(f"  cd {remote_dir} && mkdir -p logs chunks && "
-              f"sbatch --array=0-{nchunks-1} "
-              f"-p {args.partition} -t {args.time} submit_detect.slurm")
+        print(f"  cd {remote_dir} && mkdir -p logs chunks")
+        print(f"  AID=$(sbatch --parsable --array=0-{nchunks-1} "
+              f"-p {args.partition} -t {args.time} submit_detect.slurm)")
+        print(f"  sbatch --dependency=afterok:$AID "
+              f"-p {merge_part} merge.slurm   # merge runs on a compute node")
         return
 
-    # ---- submit ----
-    print("[2/5] submitting Slurm GPU array")
+    # ---- submit: detection array, then a dependent merge job ----
+    # ALL non-trivial work runs in submitted jobs on compute nodes. The login
+    # node only ever runs sbatch / squeue / sacct / mkdir here. The merge is a
+    # separate Slurm job gated on the array succeeding (afterok), so nothing
+    # heavy — not even the chunk concatenation — touches the login node.
+    print("[2/5] submitting detection array + dependent merge job")
     acct = f"-A {shlex.quote(args.account)} " if args.account else ""
     submit = (f"cd {rq_dir} && sbatch --parsable --array=0-{nchunks-1} "
               f"-p {shlex.quote(args.partition)} -t {shlex.quote(args.time)} "
               f"{acct}submit_detect.slurm")
     out, rc = ssh(args.host, args.user, submit, capture=True)
     if rc != 0 or not out:
-        sys.exit(f"ERROR: sbatch failed (rc={rc}). Output:\n{out}")
-    jobid = out.split(";")[0].split()[-1].strip()
-    print(f"      submitted array job {jobid}")
+        sys.exit(f"ERROR: sbatch (array) failed (rc={rc}). Output:\n{out}")
+    array_id = out.split(";")[0].split()[-1].strip()
+    print(f"      array job {array_id} ({nchunks} tasks)")
 
-    # ---- wait ----
-    print("[3/5] waiting for the array to finish (Ctrl-C to detach; results stay on Oscar)")
+    merge_submit = (f"cd {rq_dir} && sbatch --parsable "
+                    f"--dependency=afterok:{shlex.quote(array_id)} "
+                    f"-p {shlex.quote(merge_part)} {acct}merge.slurm")
+    out, rc = ssh(args.host, args.user, merge_submit, capture=True)
+    if rc != 0 or not out:
+        sys.exit(f"ERROR: sbatch (merge) failed (rc={rc}). Output:\n{out}")
+    merge_id = out.split(";")[0].split()[-1].strip()
+    print(f"      merge job {merge_id} (runs after the array succeeds)")
+
+    # ---- wait for the merge job ----
+    # When the merge job leaves the queue, the array has already finished (the
+    # merge depends on it). Waiting on the merge alone covers both stages.
+    print("[3/5] waiting (array -> merge; Ctrl-C to detach, jobs keep running)")
+    both = f"{array_id},{merge_id}"
     while True:
         q, _ = ssh(args.host, args.user,
-                   f"squeue -j {shlex.quote(jobid)} -h -o %T 2>/dev/null | sort | uniq -c",
+                   f"squeue -j {shlex.quote(both)} -h -o %i:%T 2>/dev/null",
                    capture=True)
         if not q.strip():
-            print("      no longer in queue")
+            print("      both jobs left the queue")
             break
         print(f"      {time.strftime('%H:%M:%S')}  {q.replace(chr(10), '  ')}")
         time.sleep(args.poll)
 
-    # An empty queue means the array LEFT the queue — completed OR failed/
-    # cancelled/timed-out. Ask the accounting DB before trusting the result:
-    # a fully-failed array otherwise sails through to merge and produces a
-    # small, real-looking detections.parquet.
-    st, _ = ssh(args.host, args.user,
-                f"sacct -j {shlex.quote(jobid)} -n -X -o State 2>/dev/null | sort | uniq -c",
-                capture=True)
-    print(f"      final task states:\n{st}")
-    bad = [ln for ln in st.splitlines()
-           if any(w in ln for w in ("FAILED", "TIMEOUT", "CANCELLED", "OUT_OF"))]
-    if bad or "COMPLETED" not in st:
-        sys.exit("ERROR: not all array tasks COMPLETED — refusing to merge a partial result.\n"
-                 f"       states:\n{st}\n"
-                 f"       Inspect {remote_dir}/logs on Oscar, fix, and re-run the failed range.")
-
-    # ---- merge ----
-    print("[4/5] merging chunks on Oscar")
-    merge = (f"cd {rq_dir} && python merge_chunks.py --chunks-dir chunks "
-             f"--job job.json --out detections.parquet --meta-out job_meta.json")
-    out, rc = ssh(args.host, args.user, merge, capture=True)
-    print(out)
-    if rc != 0:
-        sys.exit("ERROR: merge failed (incomplete chunks?) — inspect logs on Oscar under "
-                 f"{remote_dir}/logs")
+    # ---- verify on the accounting DB (still trivial login-node calls) ----
+    print("[4/5] verifying completion")
+    ast, _ = ssh(args.host, args.user,
+                 f"sacct -j {shlex.quote(array_id)} -n -X -o State 2>/dev/null | sort | uniq -c",
+                 capture=True)
+    mst, _ = ssh(args.host, args.user,
+                 f"sacct -j {shlex.quote(merge_id)} -n -X -o State 2>/dev/null",
+                 capture=True)
+    print(f"      array states:\n{ast}\n      merge state: {mst.strip()}")
+    if "COMPLETED" not in mst:
+        # afterok not satisfied (an array task failed) -> merge is CANCELLED /
+        # DependencyNeverSatisfied; or the merge itself failed (e.g. a missing
+        # chunk, which merge_chunks.py refuses to merge).
+        sys.exit("ERROR: the merge job did not COMPLETE — the result is not ready.\n"
+                 f"       array states:\n{ast}\n"
+                 f"       merge state : {mst.strip()}\n"
+                 f"       If the array had FAILED/TIMEOUT tasks the merge is cancelled by its\n"
+                 f"       afterok dependency. Inspect {remote_dir}/logs on Oscar, fix the\n"
+                 f"       failed range, and re-run.")
 
     # ---- fetch ----
     print("[5/5] fetching results")

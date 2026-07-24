@@ -20,24 +20,11 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR}"
 mkdir -p logs chunks
 
-# ==== EDIT THIS BLOCK for your Oscar environment ============================
-# Activate the Python env that has: numpy pandas opencv-python scipy pyarrow
-# and (optionally, for GPU) cupy matching the cluster CUDA.
-module load cuda 2>/dev/null || true
-# Option A - conda:
-#   module load miniconda3 && source activate colloid
-# Option B - venv:
-#   source "$HOME/envs/colloid/bin/activate"
-# Option C - module python + user site packages already on PYTHONPATH
-# Set this to 1 in the block above once you have activated the right env, so the
-# job fails fast with a clear message instead of a cryptic ImportError:
-: "${COLLOID_ENV_READY:=0}"
-# ===========================================================================
-
-if [ "${COLLOID_ENV_READY}" != "1" ]; then
-  echo "ERROR: edit the env block in submit_detect.slurm to activate your Python" >&2
-  echo "       env (numpy pandas opencv scipy pyarrow [cupy]) and set"           >&2
-  echo "       COLLOID_ENV_READY=1. See oscar/README.md step 3."                 >&2
+# Activate the Python environment (edit oscar/env.sh — one place for both jobs).
+source "${SLURM_SUBMIT_DIR}/env.sh"
+if [ "${COLLOID_ENV_READY:-0}" != "1" ]; then
+  echo "ERROR: edit oscar/env.sh to activate your Python env and set" >&2
+  echo "       COLLOID_ENV_READY=1. See oscar/README.md step 3."      >&2
   exit 1
 fi
 
