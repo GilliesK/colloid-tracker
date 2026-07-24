@@ -285,9 +285,463 @@ def _grain_bds(pts, pairs57, psi6, eps, minn, asp_thr, ang_thr):
         mis_cl = mis_all[mask]
         mis_cl = mis_cl[np.isfinite(mis_cl)]
         mm     = float(mis_cl.mean()) if len(mis_cl) else 0.
+        # Per-dislocation coordinates along the boundary — required by the
+        # Zhang–Nelson LAGB statistics (transverse/longitudinal fluctuation
+        # correlations, 1D structure factor). `members` are the 5-7 pair
+        # midpoints; `s`/`h` are their longitudinal/transverse coordinates
+        # in this frame's principal-axis frame, sorted along the boundary.
+        perp  = np.array([-axis[1], axis[0]])
+        order = np.argsort(proj)
         out.append({"kind":"LAGB" if mm<ang_thr else "HAGB",
-                    "p1":p1,"p2":p2,"n":len(cl),"aspect":asp,"misorientation_deg":mm})
+                    "p1":p1,"p2":p2,"n":len(cl),"aspect":asp,"misorientation_deg":mm,
+                    "members":cl[order].astype(np.float32),
+                    "axis":axis.astype(np.float64),"ctr":ctr.astype(np.float64),
+                    "s":proj[order].astype(np.float64),
+                    "h":(c0@perp)[order].astype(np.float64)})
     return out
+
+
+# ════════════════════════════════════════════════════════════════════
+# Zhang–Nelson LAGB statistics
+# (G. H. Zhang & D. R. Nelson, "Statistical Mechanics of Low Angle Grain
+#  Boundaries in Two Dimensions", arXiv:2009.03408)
+#
+# An LAGB is a 1D array of dislocations (5-7 pairs) with mean spacing D and
+# misorientation θ ≈ b/D. Predicted observables, per boundary, thermally
+# (time-)averaged:
+#   • B⊥(x)  = ⟨[h(s+x) − h(s)]²⟩ — transverse (glide) fluctuation
+#     correlation: bounded when pinned by the Peierls potential (T < T_P),
+#     growing ∝ ln x when depinned (T > T_P).
+#   • C∥(x)  — same construction for longitudinal (climb) displacements.
+#   • S(q)   = ⟨|Σ_n exp(iq s_n)|²⟩/N — 1D structure factor: algebraic
+#     Bragg peaks at G_m = 2πm/D with S ~ |q−G_m|^−(1−η_m),
+#     η_m(T) = m²·16π k_B T/(Y b²) — higher-m peaks melt first (η_m ≥ 1).
+#   • P(s/D) — dislocation spacing distribution; the underlying log-gas
+#     maps onto β-Gaussian random-matrix ensembles.
+# ════════════════════════════════════════════════════════════════════
+
+
+def median_nn_spacing_px(frame_results: dict, sample: int = 12) -> float:
+    """Median nearest-neighbour distance (px) pooled over up to `sample`
+    frames — the lattice constant b used in Frank's relation θ = b/D."""
+    frames = sorted(frame_results.keys())
+    if not frames:
+        return float("nan")
+    step = max(1, len(frames) // sample)
+    dists = []
+    for fr in frames[::step][:sample]:
+        res = frame_results[fr]
+        pts = getattr(res, "pts_px", None)
+        if pts is None or len(pts) < 8:
+            continue
+        d, _ = cKDTree(pts).query(pts, k=2)
+        dists.append(d[:, 1])
+    if not dists:
+        return float("nan")
+    return float(np.median(np.concatenate(dists)))
+
+
+def _rebuild_boundary(members: np.ndarray, mis_list, n_list, kinds) -> dict:
+    """Re-fit a boundary dict (axis/ctr/s/h/p1/p2) from merged member points,
+    mirroring _grain_bds' PCA construction."""
+    ctr = members.mean(0)
+    c0 = members - ctr
+    _eigs, vecs = np.linalg.eigh(c0.T @ c0)
+    axis = vecs[:, -1]
+    perp = np.array([-axis[1], axis[0]])
+    proj = c0 @ axis
+    order = np.argsort(proj)
+    w = np.asarray(n_list, dtype=float)
+    mm = float(np.average(mis_list, weights=w))
+    kind = "LAGB" if sum(wk for wk, kk in zip(w, kinds) if kk == "LAGB") >= 0.5 * w.sum() \
+        else "HAGB"
+    return {"kind": kind, "p1": ctr + proj.min() * axis, "p2": ctr + proj.max() * axis,
+            "n": len(members), "aspect": 999.0, "misorientation_deg": mm,
+            "members": members[order].astype(np.float32),
+            "axis": axis.astype(np.float64), "ctr": ctr.astype(np.float64),
+            "s": proj[order].astype(np.float64),
+            "h": (c0 @ perp)[order].astype(np.float64)}
+
+
+def trim_boundary_members(bd: dict, max_h_px: float) -> "dict | None":
+    """Drop cluster members transversely far from the boundary line.
+
+    DBSCAN's eps must be generous enough to chain dislocations ALONG the
+    boundary (spacing D can be many lattice constants), but that same reach
+    sweeps transient bulk 5-7 dipoles from inside the adjacent grains into
+    the cluster. Physical boundary dislocations sit within ~a couple of
+    lattice constants of the line, so members with |h − median(h)| beyond
+    max_h_px are contamination: they corrupt the spacing D, the structure
+    factor, the transverse correlations, AND the fragment axes (which then
+    defeats collinear merging and identity tracking). Returns a rebuilt
+    boundary dict, or None if fewer than 3 members survive."""
+    if not isinstance(bd, dict) or "h" not in bd:
+        return bd
+    h = bd["h"]
+    keep = np.abs(h - np.median(h)) <= max_h_px
+    if keep.sum() < 3:
+        return None
+    if keep.all():
+        return bd
+    return _rebuild_boundary(bd["members"][keep].astype(np.float64),
+                             [bd["misorientation_deg"]], [int(keep.sum())],
+                             [bd.get("kind", "LAGB")])
+
+
+def merge_collinear_boundaries(bds: list, gap_px: float, perp_px: float,
+                               max_angle_deg: float = 20.0) -> list:
+    """Merge boundary fragments that lie on the same line within ONE frame.
+
+    5-7 pairs blink in and out thermally, so DBSCAN routinely splits one
+    physical boundary into collinear fragments separated by gaps — which
+    makes fragment centroids jump between frames and defeats identity
+    tracking. Fragments are merged when their axes agree (sign-agnostic),
+    their lines are within perp_px of each other, and their longitudinal
+    extents are separated by less than gap_px."""
+    idx = [i for i, b in enumerate(bds) if isinstance(b, dict) and "s" in b]
+    if len(idx) < 2:
+        return list(bds)
+    cos_thr = np.cos(np.radians(max_angle_deg))
+    parent = list(range(len(bds)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a_pos in range(len(idx)):
+        for b_pos in range(a_pos + 1, len(idx)):
+            i, j = idx[a_pos], idx[b_pos]
+            bi, bj = bds[i], bds[j]
+            if abs(float(np.dot(bi["axis"], bj["axis"]))) < cos_thr:
+                continue
+            axis = bi["axis"]
+            perp = np.array([-axis[1], axis[0]])
+            dctr = bj["ctr"] - bi["ctr"]
+            if abs(float(dctr @ perp)) > perp_px:
+                continue
+            # longitudinal gap between the two extent intervals on bi's axis
+            si = bi["s"]
+            sj = (bj["members"].astype(np.float64) - bi["ctr"]) @ axis
+            gap = max(sj.min() - si.max(), si.min() - sj.max())
+            if gap > gap_px:
+                continue
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+    groups: dict = {}
+    for i in idx:
+        groups.setdefault(find(i), []).append(i)
+    out = [b for i, b in enumerate(bds) if i not in idx]   # pass through others
+    for members_idx in groups.values():
+        if len(members_idx) == 1:
+            out.append(bds[members_idx[0]])
+        else:
+            pts = np.vstack([bds[i]["members"].astype(np.float64) for i in members_idx])
+            out.append(_rebuild_boundary(
+                pts,
+                [bds[i]["misorientation_deg"] for i in members_idx],
+                [bds[i]["n"] for i in members_idx],
+                [bds[i].get("kind", "LAGB") for i in members_idx]))
+    return out
+
+
+def track_boundaries(frame_results: dict, max_perp_px: float = 60.0,
+                     max_angle_deg: float = 25.0, memory: int = 10,
+                     min_frames: int = 10, merge_gap_px: "float | None" = None) -> dict:
+    """Assign persistent identities to grain boundaries across frames.
+
+    Association is LINE-based, not centroid-based: a detection matches a
+    live boundary when their axes agree (sign-agnostic), the detection's
+    centroid lies within max_perp_px of the live boundary's line, and their
+    longitudinal extents overlap (or nearly so). This is robust to the
+    fragment-flicker that shifts centroids by hundreds of px between frames.
+    When merge_gap_px is set, collinear fragments are first merged per frame
+    (see merge_collinear_boundaries). A boundary may go undetected for up to
+    `memory` consecutive frames without losing its identity.
+
+    frame_results values may be FrameResult objects (`.boundaries` is read)
+    or plain lists of boundary dicts. Returns {gb_id: [(frame, bd), ...]}
+    for identities seen in ≥ min_frames frames."""
+    frames = sorted(frame_results.keys())
+    live: dict = {}     # gb_id -> {"ctr","axis","smin","smax","missing"}
+    hist: dict = {}
+    next_id = 0
+    cos_thr = np.cos(np.radians(max_angle_deg))
+
+    def extent(bd):
+        return float(bd["s"].min()), float(bd["s"].max())
+
+    for fr in frames:
+        res = frame_results[fr]
+        raw = res if isinstance(res, list) else getattr(res, "boundaries", [])
+        bds = [b for b in raw if isinstance(b, dict) and "s" in b and "axis" in b]
+        if merge_gap_px is not None and len(bds) > 1:
+            bds = [b for b in merge_collinear_boundaries(
+                       bds, gap_px=merge_gap_px, perp_px=max_perp_px)
+                   if "s" in b]
+        cand = []      # (perp_offset, live_id, bd_idx)
+        for lid, st in live.items():
+            perp = np.array([-st["axis"][1], st["axis"][0]])
+            for bi, bd in enumerate(bds):
+                if abs(float(np.dot(bd["axis"], st["axis"]))) < cos_thr:
+                    continue
+                dctr = bd["ctr"] - st["ctr"]
+                off = abs(float(dctr @ perp))
+                if off > max_perp_px:
+                    continue
+                # longitudinal proximity: project candidate extent onto the
+                # live axis; require overlap or a gap below half a length
+                lo = float(dctr @ st["axis"]) + float(bd["s"].min())
+                hi = float(dctr @ st["axis"]) + float(bd["s"].max())
+                gap = max(st["smin"] - hi, lo - st["smax"])
+                max_gap = 0.5 * max(st["smax"] - st["smin"], hi - lo)
+                if gap > max_gap:
+                    continue
+                cand.append((off, lid, bi))
+        cand.sort(key=lambda t: t[0])
+        used_l, used_b = set(), set()
+        matched: dict = {}   # live_id -> [bd_idx, ...] (primary + absorbed)
+        for off, lid, bi in cand:
+            if lid in used_l or bi in used_b:
+                continue
+            used_l.add(lid); used_b.add(bi)
+            matched[lid] = [bi]
+        # Absorption pass: residual fragments of an already-matched identity
+        # (the same line, but the per-frame merge left them separate — e.g.
+        # a detection hole wider than the merge gap) join that identity
+        # instead of spawning a competing one.
+        for off, lid, bi in cand:
+            if lid in matched and bi not in used_b:
+                used_b.add(bi)
+                matched[lid].append(bi)
+        for lid, bidxs in matched.items():
+            if len(bidxs) == 1:
+                bd = bds[bidxs[0]]
+            else:
+                pts = np.vstack([bds[i]["members"].astype(np.float64) for i in bidxs])
+                bd = _rebuild_boundary(
+                    pts,
+                    [bds[i]["misorientation_deg"] for i in bidxs],
+                    [bds[i]["n"] for i in bidxs],
+                    [bds[i].get("kind", "LAGB") for i in bidxs])
+            smin, smax = extent(bd)
+            live[lid] = {"ctr": bd["ctr"], "axis": bd["axis"],
+                         "smin": smin, "smax": smax, "missing": 0}
+            hist[lid].append((fr, bd))
+        for lid in [l for l in live if l not in used_l]:
+            live[lid]["missing"] += 1
+            if live[lid]["missing"] > memory:
+                del live[lid]
+        for bi, bd in enumerate(bds):
+            if bi in used_b:
+                continue
+            smin, smax = extent(bd)
+            live[next_id] = {"ctr": bd["ctr"], "axis": bd["axis"],
+                             "smin": smin, "smax": smax, "missing": 0}
+            hist[next_id] = [(fr, bd)]
+            next_id += 1
+    return {lid: snaps for lid, snaps in hist.items() if len(snaps) >= min_frames}
+
+
+def _grain_band_misorientation(snapshots: list, frame_results: dict,
+                               axis: np.ndarray, ctr0: np.ndarray,
+                               b_px: float, D_px: float) -> float:
+    """Misorientation θ measured from the GRAINS on either side of the
+    boundary (degrees). The per-pair value stored by _grain_bds compares ψ₆
+    between the 5- and 7-coordinated partners *inside* the distorted core
+    and badly underestimates θ; here we average the ψ₆ orientation field in
+    a band beside the boundary on each side — outside the core, inside the
+    adjacent crystals — and difference the two grain orientations."""
+    perp = np.array([-axis[1], axis[0]])
+    inner = 1.5 * b_px
+    outer = inner + max(2.0 * b_px, 0.5 * D_px)
+    acc = {+1: [], -1: []}
+    for fr, bd in snapshots:
+        res = frame_results.get(fr)
+        pts = getattr(res, "pts_px", None)
+        psi6 = getattr(res, "psi6", None)
+        if pts is None or psi6 is None or len(pts) != len(psi6):
+            continue
+        rel = pts - ctr0
+        s = rel @ axis
+        h = rel @ perp
+        smin, smax = bd["s"].min(), bd["s"].max()
+        in_extent = (s > smin) & (s < smax)
+        strong = np.abs(psi6) > 0.3
+        for side in (+1, -1):
+            m = in_extent & strong & (side * h > inner) & (side * h < outer)
+            if m.sum() >= 5:
+                # orientation average on the unit circle of 6θ
+                u = psi6[m] / np.abs(psi6[m])
+                acc[side].append(np.mean(u))
+    if not acc[+1] or not acc[-1]:
+        return float("nan")
+    a1 = np.angle(np.mean(acc[+1])) / 6.0
+    a2 = np.angle(np.mean(acc[-1])) / 6.0
+    dth = np.degrees(a1 - a2)
+    # wrap into the ±30° fundamental zone of 6-fold symmetry
+    dth = (dth + 30.0) % 60.0 - 30.0
+    return float(abs(dth))
+
+
+def _collapse_cores(s: np.ndarray, h: np.ndarray, core_px: float):
+    """Collapse redundant 5-7 pairs at one dislocation core into a single
+    point (centroid). The pairing step can emit 2-3 overlapping pairs per
+    core (a 5 pairing with several nearby 7s, transient thermal pairs), and
+    treating those as separate 'dislocations' corrupts the spacing D and
+    every statistic built on it. Points closer than core_px along the
+    (sorted) boundary are grouped and averaged."""
+    if len(s) == 0 or not np.isfinite(core_px) or core_px <= 0:
+        return s, h
+    brk = np.nonzero(np.diff(s) > core_px)[0] + 1
+    groups = np.split(np.arange(len(s)), brk)
+    s_out = np.array([s[g].mean() for g in groups])
+    h_out = np.array([h[g].mean() for g in groups])
+    return s_out, h_out
+
+
+def lagb_statistics(snapshots: list, px_um: float,
+                    nn_spacing_px: float = float("nan"),
+                    n_q: int = 1600, m_max: int = 3,
+                    frame_results: "dict | None" = None) -> dict:
+    """Zhang–Nelson observables for ONE persistently-tracked boundary.
+
+    snapshots: [(frame, boundary_dict), ...] from track_boundaries().
+    All returned distances are in µm; correlations in µm².
+
+    Registration note: B⊥/C∥ are built from *within-frame pairwise
+    differences*, so rigid per-frame translations/drift of the boundary
+    cancel exactly; the pooled principal axis only fixes a common
+    orientation. |FT|² likewise makes S(q) insensitive to per-frame rigid
+    longitudinal shifts."""
+    # ── pooled orientation: PCA over ALL member points of ALL frames ───
+    # (averaging per-frame fragment axes lets short, noisily-tilted
+    # fragments rotate the reference line; a ~2° error turns into a
+    # spurious (εx)² term that dwarfs the real transverse fluctuations)
+    pooled = np.vstack([bd["members"].astype(np.float64) for _, bd in snapshots])
+    ctr0 = pooled.mean(0)
+    c0 = pooled - ctr0
+    _eigs, vecs = np.linalg.eigh(c0.T @ c0)
+    axis = vecs[:, -1]
+    perp = np.array([-axis[1], axis[0]])
+
+    per_frame = []          # (s_um sorted, h_um) per frame — one point per CORE
+    spacings = []
+    mis = []
+    core_px_um = 2.0 * nn_spacing_px * px_um if np.isfinite(nn_spacing_px) else 0.0
+    for _, bd in snapshots:
+        rel = bd["members"].astype(np.float64) - ctr0
+        s = rel @ axis * px_um
+        h = rel @ perp * px_um
+        o = np.argsort(s)
+        s, h = _collapse_cores(s[o], h[o], core_px_um)
+        per_frame.append((s, h))
+        if len(s) > 1:
+            spacings.append(np.diff(s))
+        mis.append(bd.get("misorientation_deg", np.nan))
+    all_sp = np.concatenate(spacings) if spacings else np.array([np.nan])
+    D = float(np.median(all_sp))                       # µm
+    if not np.isfinite(D) or D <= 0:
+        # Degenerate boundary (e.g. every member collapsed into one core —
+        # can only happen when D ≲ 2b, i.e. not actually a LOW-angle GB).
+        # Return a well-formed result full of NaNs rather than crashing.
+        empty = np.array([np.nan])
+        return {"n_frames": len(per_frame),
+                "n_dislocations": float(np.mean([len(s) for s, _ in per_frame])),
+                "D_um": float("nan"), "L_um": float("nan"), "b_um": float(b_um),
+                "theta_psi6_deg": theta_psi6, "theta_frank_deg": float("nan"),
+                "theta_grains_deg": float("nan"),
+                "x_um": empty, "B_perp_um2": empty, "C_par_um2": empty,
+                "q_um_inv": empty, "S_q": empty, "G1_um_inv": float("nan"),
+                "eta_m": [float("nan")] * m_max, "dq_res_um_inv": float("nan"),
+                "spacings_norm": empty}
+    theta_psi6 = float(np.nanmean(mis))                # degrees
+    b_um = nn_spacing_px * px_um
+    theta_frank = float(np.degrees(b_um / D)) if D > 0 and np.isfinite(b_um) else float("nan")
+
+    # ── pairwise fluctuation correlations, binned by separation ────────
+    L = max(float(np.ptp(s)) for s, _ in per_frame if len(s)) if per_frame else 0.0
+    nbins = max(4, int(L / max(D, 1e-9) * 2))          # D/2-wide bins
+    edges = np.linspace(0.0, L + 1e-9, nbins + 1)
+    bsum = np.zeros(nbins); bcnt = np.zeros(nbins)     # transverse
+    csum = np.zeros(nbins); ccnt = np.zeros(nbins)     # longitudinal
+    for s, h in per_frame:
+        M = len(s)
+        if M < 3:
+            continue
+        i, j = np.triu_indices(M, k=1)
+        dx = s[j] - s[i]
+        bi = np.clip(np.searchsorted(edges, dx, side="right") - 1, 0, nbins - 1)
+        np.add.at(bsum, bi, (h[j] - h[i]) ** 2)
+        np.add.at(bcnt, bi, 1)
+        # climb: deviation of the pair separation from its ideal (j-i)·D
+        np.add.at(csum, bi, (dx - (j - i) * D) ** 2)
+        np.add.at(ccnt, bi, 1)
+    with np.errstate(invalid="ignore"):
+        B_perp = np.where(bcnt > 0, bsum / np.maximum(bcnt, 1), np.nan)
+        C_par  = np.where(ccnt > 0, csum / np.maximum(ccnt, 1), np.nan)
+    x_centers = 0.5 * (edges[:-1] + edges[1:])
+
+    # ── 1D structure factor, frame-averaged ────────────────────────────
+    G1 = 2.0 * np.pi / max(D, 1e-9)
+    q = np.linspace(0.05 * G1, (m_max + 0.5) * G1, n_q)
+    S = np.zeros_like(q)
+    nf = 0
+    for s, _ in per_frame:
+        if len(s) < 4:
+            continue
+        ph = np.exp(1j * np.outer(q, s))
+        S += (np.abs(ph.sum(axis=1)) ** 2) / len(s)
+        nf += 1
+    S = S / max(nf, 1)
+
+    # ── Bragg-peak exponents η_m: S ~ |q−G_m|^−(1−η_m) near each peak ──
+    dq_res = 2.0 * np.pi / max(L, 1e-9)                # finite-length resolution
+    etas = []
+    for m in range(1, m_max + 1):
+        Gm = m * G1
+        k = np.abs(q - Gm)
+        win = (k > dq_res) & (k < 0.35 * G1) & (S > 0)
+        if win.sum() >= 8:
+            slope = np.polyfit(np.log(k[win]), np.log(S[win]), 1)[0]
+            etas.append(float(1.0 + slope))
+        else:
+            etas.append(float("nan"))
+
+    theta_grains = _grain_band_misorientation(
+        snapshots, frame_results, axis, ctr0, nn_spacing_px, D / max(px_um, 1e-12)) \
+        if frame_results is not None else float("nan")
+
+    return {
+        "n_frames": len(per_frame),
+        "n_dislocations": float(np.mean([len(s) for s, _ in per_frame])),
+        "D_um": D, "L_um": L, "b_um": float(b_um),
+        "theta_psi6_deg": theta_psi6, "theta_frank_deg": theta_frank,
+        "theta_grains_deg": theta_grains,
+        "x_um": x_centers, "B_perp_um2": B_perp, "C_par_um2": C_par,
+        "q_um_inv": q, "S_q": S, "G1_um_inv": float(G1),
+        "eta_m": etas, "dq_res_um_inv": float(dq_res),
+        "spacings_norm": (all_sp / D) if D > 0 else all_sp,
+    }
+
+
+def wigner_surmise(x: np.ndarray, beta: int) -> np.ndarray:
+    """Nearest-neighbour spacing distributions of the β-Gaussian ensembles
+    (Wigner surmises, β = 1/2/4) plus the β=0 Poisson case — reference
+    curves for the LAGB spacing statistics."""
+    x = np.asarray(x, dtype=np.float64)
+    if beta == 0:
+        return np.exp(-x)
+    if beta == 1:
+        return (np.pi / 2.0) * x * np.exp(-np.pi * x ** 2 / 4.0)
+    if beta == 2:
+        return (32.0 / np.pi ** 2) * x ** 2 * np.exp(-4.0 * x ** 2 / np.pi)
+    if beta == 4:
+        return (2.0 ** 18 / (3.0 ** 6 * np.pi ** 3)) * x ** 4 * \
+               np.exp(-64.0 * x ** 2 / (9.0 * np.pi))
+    raise ValueError("beta must be 0, 1, 2 or 4")
 
 
 def _pair_correlation_hist(pts_um: np.ndarray, psi6: np.ndarray, r_max_um: float,
@@ -496,6 +950,55 @@ def _defect_concentration_series(frame_results: dict) -> pd.DataFrame:
     return df.sort_values("frame").reset_index(drop=True)
 
 
+def grain_misorientation_1f(pts: np.ndarray, psi6: np.ndarray, bd: dict,
+                            b_px: float) -> dict:
+    """Single-frame misorientation θ across ONE boundary, measured from the
+    GRAINS on either side (degrees, in the ±30° fundamental zone of 6-fold
+    symmetry).
+
+    This is the ACCURATE θ. The `misorientation_deg` stored by _grain_bds
+    compares ψ₆ between the 5- and 7-coordinated partners *inside* the
+    distorted dislocation core and underestimates the true grain
+    misorientation by roughly 3× (verified on a synthetic 5° bicrystal:
+    core-pair method gave 1.5°, this band method gave 5.00°). Here we average
+    the ψ₆ orientation field in a band of undistorted crystal on each side of
+    the boundary line — outside the core, inside the adjacent grains — and
+    difference the two grain orientations.
+
+    Returns {} when either band lacks enough well-ordered particles."""
+    axis = bd.get("axis"); ctr = bd.get("ctr"); s_arr = bd.get("s")
+    if axis is None or ctr is None or s_arr is None or len(pts) == 0:
+        return {}
+    axis = np.asarray(axis, float); ctr = np.asarray(ctr, float)
+    perp = np.array([-axis[1], axis[0]])
+    rel = np.asarray(pts, float) - ctr
+    s = rel @ axis
+    h = rel @ perp
+    # Dislocation spacing along this boundary sets how far out the grain is
+    # undistorted; fall back to the lattice constant when there's one core.
+    D_px = float(np.median(np.diff(np.sort(np.asarray(s_arr, float))))) \
+        if len(s_arr) > 1 else float(b_px)
+    inner = 1.5 * b_px
+    outer = inner + max(2.0 * b_px, 0.5 * max(D_px, b_px))
+    in_extent = (s > float(np.min(s_arr))) & (s < float(np.max(s_arr)))
+    strong = np.abs(psi6) > 0.3          # only well-ordered particles carry orientation
+    res: dict = {}
+    ang: dict = {}
+    for side in (+1, -1):
+        m = in_extent & strong & (side * h > inner) & (side * h < outer)
+        if int(m.sum()) >= 5:
+            u = psi6[m] / np.abs(psi6[m])
+            ang[side] = (float(np.angle(np.mean(u)) / 6.0), int(m.sum()))
+    if (+1) in ang and (-1) in ang:
+        dth = np.degrees(ang[+1][0] - ang[-1][0])
+        dth = (dth + 30.0) % 60.0 - 30.0     # 6-fold fundamental zone
+        res = {"theta_grains_deg": float(abs(dth)),
+               "grain_angle_a_deg": float(np.degrees(ang[+1][0])),
+               "grain_angle_b_deg": float(np.degrees(ang[-1][0])),
+               "n_band_a": ang[+1][1], "n_band_b": ang[-1][1]}
+    return res
+
+
 def analyze_frame(pts: np.ndarray, dp: dict) -> FrameResult:
     # Optional max-neighbour-distance cutoff (µm, converted to px via px_um)
     # to reject long spurious Delaunay edges at cluster boundaries / dilute
@@ -505,8 +1008,27 @@ def analyze_frame(pts: np.ndarray, dp: dict) -> FrameResult:
     max_dist_px = (max_dist_um / px_um) if (max_dist_um > 0 and px_um > 0) else None
     coord, psi6, edges = _delaunay(pts, max_dist_px=max_dist_px)
     pairs57 = _57_pairs(pts, coord, edges, dp["pair_dist_px"])
+    # skip_boundaries: caller wants coordination / ψ₆ / 5-7 pairs but NOT the
+    # grain-boundary detector. Skips the DBSCAN clustering in _grain_bds and
+    # the per-boundary grain_misorientation_1f pass below — the two most
+    # expensive steps here — so the live overlay stays responsive on dense
+    # frames where boundary detection is meaningless anyway (fine polycrystal).
+    if dp.get("skip_boundaries", False):
+        return FrameResult(pts, coord, psi6, pairs57, [], edges)
     bds     = _grain_bds(pts, pairs57, psi6, dp["lagb_eps_px"], dp["lagb_min_n"],
                           dp["lagb_aspect"], dp["lagb_angle_deg"])
+    # Attach the ACCURATE grain-band misorientation to each boundary (the
+    # core-pair `misorientation_deg` underestimates θ ~3×; see
+    # grain_misorientation_1f). Cost is negligible — a handful of boundaries,
+    # each a vectorised pass over pts — so the live overlay gets it too.
+    if bds and len(pts) >= 8:
+        try:
+            _d, _ = cKDTree(pts).query(pts, k=2)
+            b_px = float(np.median(_d[:, 1]))
+            for _bd in bds:
+                _bd.update(grain_misorientation_1f(pts, psi6, _bd, b_px))
+        except Exception:
+            pass
     return FrameResult(pts, coord, psi6, pairs57, bds, edges)
 
 
