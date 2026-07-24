@@ -90,6 +90,17 @@ It probes the video, stages files, submits the detection array **and a dependent
 merge job**, waits, and downloads `results/<jobname>/{detections.parquet,
 job_meta.json}`.
 
+While it waits it prints a live progress line each poll — tasks done, how many
+are **running** (concurrency) vs **queued**, the per-frame detection time, and a
+time-averaged **ETA** to the finished result:
+
+```
+[3/5] waiting (array -> merge; Ctrl-C to detach, jobs keep running)
+      14:22:37  5/33 tasks done | 8 running, 20 queued | 0.041 s/frame/task | ETA 9m30s (~14:32:07)
+      ...
+      14:31:10  33/33 tasks done | 0 running, 0 queued | merging (running)...
+```
+
 **Nothing non-trivial runs on the login node.** Detection runs in the Slurm
 array; the chunk merge is a *separate Slurm job* gated on the array succeeding
 (`--dependency=afterok`), so even the concatenation happens on a compute node.

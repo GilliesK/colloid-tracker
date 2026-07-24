@@ -51,6 +51,19 @@ def scp_from(host, user, remote_path, local_dst):
     return sh(["scp", "-C", f"{user}@{host}:{shlex.quote(remote_path)}", str(local_dst)]).returncode
 
 
+def _dur(sec):
+    """Compact duration, e.g. 1h03m / 4m12s / 45s."""
+    sec = int(max(0, sec))
+    h, r = divmod(sec, 3600); m, s = divmod(r, 60)
+    if h: return f"{h}h{m:02d}m"
+    if m: return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _clock(epoch):
+    return time.strftime("%H:%M:%S", time.localtime(epoch))
+
+
 def probe_video(path):
     import cv2
     cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
@@ -226,19 +239,78 @@ def main():
     merge_id = out.split(";")[0].split()[-1].strip()
     print(f"      merge job {merge_id} (runs after the array succeeds)")
 
-    # ---- wait for the merge job ----
-    # When the merge job leaves the queue, the array has already finished (the
-    # merge depends on it). Waiting on the merge alone covers both stages.
+    # ---- wait: array -> merge, with a live progress readout ----
+    # Each poll reports: how many tasks are done, how many are RUNNING (usage /
+    # concurrency) vs PENDING (queue depth), the per-frame detection time, and a
+    # time-averaged ETA to the finished result. All from trivial squeue calls.
     print("[3/5] waiting (array -> merge; Ctrl-C to detach, jobs keep running)")
-    both = f"{array_id},{merge_id}"
+    total = nchunks
+    t_wait0 = time.time()
+    hist = []                                # (t, done_tasks) for a windowed rate
+    eta_ema = None                           # smoothed ETA seconds
+    window = max(90.0, args.poll * 4)        # rate-averaging window (s)
     while True:
-        q, _ = ssh(args.host, args.user,
-                   f"squeue -j {shlex.quote(both)} -h -o %i:%T 2>/dev/null",
-                   capture=True)
-        if not q.strip():
-            print("      both jobs left the queue")
+        # Array element states. -r expands the array so a PENDING range counts
+        # as its individual tasks, not one line. Completed/failed tasks have
+        # left the queue, so done = total - still-in-queue.
+        aq, _ = ssh(args.host, args.user,
+                    f"squeue -j {shlex.quote(array_id)} -h -r -o %T 2>/dev/null "
+                    f"| sort | uniq -c", capture=True)
+        counts = {}
+        for ln in aq.splitlines():
+            parts = ln.split()
+            if len(parts) == 2 and parts[0].isdigit():
+                counts[parts[1]] = int(parts[0])
+        running = counts.get("RUNNING", 0)
+        pending = sum(v for k, v in counts.items() if k not in ("RUNNING",))
+        in_queue = sum(counts.values())
+        done = max(0, total - in_queue)
+
+        merge_state, _ = ssh(args.host, args.user,
+                             f"squeue -j {shlex.quote(merge_id)} -h -o %T 2>/dev/null",
+                             capture=True)
+        merge_state = merge_state.strip()
+
+        if in_queue == 0 and not merge_state:
+            print(f"      {time.strftime('%H:%M:%S')}  all tasks left the queue")
             break
-        print(f"      {time.strftime('%H:%M:%S')}  {q.replace(chr(10), '  ')}")
+
+        now = time.time()
+        hist.append((now, done))
+        while len(hist) > 2 and now - hist[0][0] > window:
+            hist.pop(0)
+        # Time-averaged completion rate (tasks/s): windowed slope, falling back
+        # to the run-long average until the window fills.
+        rate = 0.0
+        if len(hist) >= 2 and hist[-1][1] > hist[0][1] and hist[-1][0] > hist[0][0]:
+            rate = (hist[-1][1] - hist[0][1]) / (hist[-1][0] - hist[0][0])
+        elif done > 0:
+            rate = done / max(1e-9, now - t_wait0)
+
+        # Per-task detection cost: with `running` tasks in flight, one task
+        # clears chunk_size frames every running/rate seconds. (ASCII only —
+        # a Windows console mangles non-ASCII glyphs.)
+        if rate > 0 and args.chunk_size > 0:
+            spf = (max(running, 1) / rate) / args.chunk_size
+            spf_str = f"{spf:.3f} s/frame/task"
+        else:
+            spf_str = "s/frame n/a"
+
+        if in_queue == 0 and merge_state:
+            eta_str = f"merging ({merge_state.lower()})..."
+        elif len(hist) < 2:
+            eta_str = "ETA measuring..."
+        elif rate > 0:
+            eta = (total - done) / rate
+            eta_ema = eta if eta_ema is None else 0.5 * eta_ema + 0.5 * eta
+            eta_str = f"ETA {_dur(eta_ema)} (~{_clock(now + eta_ema)})"
+        elif running == 0:
+            eta_str = "ETA n/a (waiting in queue for a node)"
+        else:
+            eta_str = "ETA n/a (no tasks finished yet)"
+
+        print(f"      {time.strftime('%H:%M:%S')}  {done}/{total} tasks done "
+              f"| {running} running, {pending} queued | {spf_str} | {eta_str}")
         time.sleep(args.poll)
 
     # ---- verify on the accounting DB (still trivial login-node calls) ----
