@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Merge per-chunk detection Parquets into one detections.parquet + job_meta.json.
 
-Runs on Oscar after the Slurm array finishes (or locally after fetch). Verifies
-every expected chunk is present, concatenates in frame order, and writes a
-metadata sidecar the desktop loader reads to reconstruct AnalysisData.
+Runs as a compute-node Slurm job (merge.slurm). STREAMS the chunks — appends one
+at a time to the output file with a single pyarrow ParquetWriter — so peak memory
+is ~one chunk, not the whole dataset. A long run is hundreds of millions of
+detection rows (tens of GB); loading them all and pd.concat'ing OOM-kills the job.
+
+Chunks are already in frame order (chunk_00000 = frames [s..], chunk_00001 =
+[s+chunk..], and each worker writes its frames in increasing order), so appending
+in sorted-filename order yields a frame-sorted file with no global sort.
 """
 from __future__ import annotations
 import argparse, glob, json, os, sys
 import numpy as np
-import pandas as pd
+import pyarrow.parquet as pq
 
 
 def main():
@@ -41,23 +46,37 @@ def main():
             f"before merging. Refusing to write a partial detections.parquet.\n")
         sys.exit(3)
 
-    parts = [pd.read_parquet(f) for f in files]
-    det = pd.concat(parts, ignore_index=True)
-    det = det.sort_values(["frame"]).reset_index(drop=True)
-    det["frame"] = det["frame"].astype("int32")
+    # ---- streaming merge: one chunk resident at a time ----
+    writer = None
+    schema = None
+    total_rows = 0
+    frames_seen: set = set()
+    for fp in files:
+        t = pq.read_table(fp)            # one chunk (~chunk_size * particles rows)
+        if schema is None:
+            schema = t.schema
+        if t.num_rows == 0:
+            continue                     # empty chunk (all its frames had 0 detections)
+        if writer is None:
+            writer = pq.ParquetWriter(args.out, schema)
+        writer.write_table(t)
+        total_rows += t.num_rows
+        frames_seen.update(np.unique(t.column("frame").to_numpy()).tolist())
+    if writer is not None:
+        writer.close()
+    elif schema is not None:
+        pq.ParquetWriter(args.out, schema).close()   # all empty -> valid empty file
+    else:
+        sys.stderr.write("ERROR: chunks contained no readable schema.\n"); sys.exit(2)
 
-    frames_present = np.unique(det["frame"].to_numpy())
     s, e = int(job["frame_start"]), int(job["frame_end"])
     expected = set(range(s, e + 1))
-    got = set(int(x) for x in frames_present)
-    missing = sorted(expected - got)     # frames with zero detections look "missing" too
-
-    det.to_parquet(args.out, index=False)
+    missing = sorted(expected - frames_seen)   # frames with zero detections
 
     meta = dict(job)
     meta.update({
-        "n_detections": int(len(det)),
-        "frames_with_detections": int(len(got)),
+        "n_detections": int(total_rows),
+        "frames_with_detections": int(len(frames_seen)),
         "frames_expected": int(len(expected)),
         # A frame may legitimately have 0 detections; report the list so the
         # loader/user can tell "empty frame" from "chunk never ran".
@@ -69,7 +88,7 @@ def main():
         json.dump(meta, f, indent=2)
 
     print(f"merged {len(files)} chunks -> {args.out}")
-    print(f"  {len(det):,} detections over {len(got):,}/{len(expected):,} frames")
+    print(f"  {total_rows:,} detections over {len(frames_seen):,}/{len(expected):,} frames")
     if missing:
         print(f"  NOTE: {len(missing)} frames had no detections "
               f"(empty frames or an incomplete array job): "
