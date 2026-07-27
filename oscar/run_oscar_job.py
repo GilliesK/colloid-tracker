@@ -93,10 +93,17 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=400, help="frames per Slurm array task")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=-1, help="-1 = last frame")
-    ap.add_argument("--partition", default="gpu", help="partition for the detection array")
+    ap.add_argument("--partition", default="batch",
+                    help="partition for the detection array (default a CPU partition; "
+                         "the speedup is parallelism across many tasks, not per-task GPU). "
+                         "Check names with `sinfo -s` on Oscar.")
+    ap.add_argument("--gpu", action="store_true",
+                    help="request a GPU per task (--gres=gpu:1) and use the cupy detection "
+                         "path. Requires cupy installed in the env AND a GPU --partition. "
+                         "Off by default: GPU nodes queue longer and the win here is "
+                         "concurrency, not per-frame GPU speed.")
     ap.add_argument("--merge-partition", default=None,
-                    help="partition for the (CPU-only) merge job; defaults to --partition. "
-                         "Set a CPU/batch partition to avoid holding a GPU for the merge.")
+                    help="partition for the (CPU-only) merge job; defaults to --partition.")
     ap.add_argument("--account", default=None)
     ap.add_argument("--time", default="02:00:00", help="per-task walltime")
     ap.add_argument("--results-dir", default=str(HERE / "results"))
@@ -182,6 +189,7 @@ def main():
         "frame_start": s, "frame_end": e,
         "chunk_size": args.chunk_size, "n_chunks": nchunks,
         "decode_from_start": bool(args.decode_from_start),
+        "gpu": bool(args.gpu),
         "created": ts, "schema_version": 1,
     }
     local_job = HERE / f"job_{jobname}.json"
@@ -190,7 +198,8 @@ def main():
     print(f"\nvideo   : {video.name}  ({w}x{h}, {n} frames, {fps:.2f} fps)")
     print(f"range   : {s}..{e}  ->  {nchunks} chunks of {args.chunk_size} frames")
     print(f"oscar   : {args.user}@{args.host}:{remote_dir}")
-    print(f"backend : GPU array on partition '{args.partition}'\n")
+    print(f"backend : {'GPU (cupy)' if args.gpu else 'CPU'} array on partition "
+          f"'{args.partition}'  ({nchunks} tasks in parallel)\n")
 
     # ---- stage ----
     print("[1/5] staging files to Oscar")
@@ -201,15 +210,15 @@ def main():
     scp(local_job, args.host, args.user, f"{remote_dir}/job.json")
     scp(video, args.host, args.user, f"{remote_dir}/{video.name}")
 
-    dfs = " --decode-from-start" if args.decode_from_start else ""
     merge_part = args.merge_partition or args.partition
+    gres = "--gres=gpu:1 " if args.gpu else ""      # request a GPU only with --gpu
     if args.no_submit:
         print("\n--no-submit: staged only. To run manually on Oscar (all compute on")
         print("nodes — do NOT run merge_chunks.py on the login node):")
         print(f"  ssh {args.user}@{args.host}")
         print(f"  cd {remote_dir} && mkdir -p logs chunks")
         print(f"  AID=$(sbatch --parsable --array=0-{nchunks-1} "
-              f"-p {args.partition} -t {args.time} submit_detect.slurm)")
+              f"-p {args.partition} -t {args.time} {gres}submit_detect.slurm)")
         print(f"  sbatch --dependency=afterok:$AID "
               f"-p {merge_part} merge.slurm   # merge runs on a compute node")
         return
@@ -223,7 +232,7 @@ def main():
     acct = f"-A {shlex.quote(args.account)} " if args.account else ""
     submit = (f"cd {rq_dir} && sbatch --parsable --array=0-{nchunks-1} "
               f"-p {shlex.quote(args.partition)} -t {shlex.quote(args.time)} "
-              f"{acct}submit_detect.slurm")
+              f"{gres}{acct}submit_detect.slurm")
     out, rc = ssh(args.host, args.user, submit, capture=True)
     if rc != 0 or not out:
         sys.exit(f"ERROR: sbatch (array) failed (rc={rc}). Output:\n{out}")

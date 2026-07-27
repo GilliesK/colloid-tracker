@@ -35,8 +35,8 @@ Only coordinates come back (a few MB), never the video — the app already has i
 
 1. **SSH key** so the launcher isn't prompting for a password every step:
    `ssh-copy-id you@ssh.ccv.brown.edu`
-2. **Python env** with: `numpy pandas opencv-python scipy pyarrow` and, for GPU,
-   `cupy` matching Oscar's CUDA (`module load cuda`). Example:
+2. **Python env** with: `numpy pandas opencv-python-headless scipy pyarrow`
+   (add `cupy` matching Oscar's CUDA *only* if you'll use `--gpu`). Example:
    ```bash
    module load miniconda3
    conda create -n colloid python=3.11 numpy pandas scipy pyarrow -y
@@ -69,8 +69,17 @@ python run_oscar_job.py \
     --video "D:/LAGB/long_run.mp4" \
     --params params.json \
     --host ssh.ccv.brown.edu --user YOURID \
-    --chunk-size 400 --partition gpu
+    --chunk-size 400 --partition batch
 ```
+
+**CPU by default — the speedup is parallelism, not the GPU.** Each task detects
+at about local speed; the win is running *many* tasks at once. CPU partitions are
+far less restricted than GPU, so you get more tasks running concurrently (and a
+shorter queue) than fighting for scarce GPU nodes. Only add `--gpu` (which adds
+`--gres=gpu:1` and uses the cupy path) if cupy is installed in the env and you've
+set a GPU `--partition` — otherwise you queue for a GPU and still run on CPU.
+Tune throughput with `--chunk-size`: smaller = more tasks = more parallelism, up
+to the array-size cap.
 
 **Analysis region (ROI).** To confine the cluster run to a freehand region — the
 same as drawing one locally — draw it in the app with the **✎ ROI** button, then

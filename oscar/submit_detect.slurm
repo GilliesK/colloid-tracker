@@ -1,8 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=colloid_detect
 #SBATCH --array=0-0                     # OVERRIDDEN by the launcher: --array=0-(nchunks-1)
-#SBATCH --partition=gpu                 # Brown CCV Oscar GPU partition (see README if yours differs)
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=02:00:00
@@ -13,8 +11,13 @@
 # Reads chunk_size / frame_start / frame_end from job.json and computes its own
 # range from SLURM_ARRAY_TASK_ID, then runs the shared detection core.
 #
+# CPU by default (the speedup is PARALLELISM across many tasks, not per-task
+# GPU). Partition comes from the launcher's -p; a GPU is requested only when the
+# launcher is run with --gpu (adds --gres=gpu:1 and sets job.json "gpu": true,
+# which also passes --gpu to the worker). GPU needs cupy installed in the env.
+#
 # Submit via run_oscar_job.py (recommended) which sets --array and the job dir.
-# Manual:  cd <jobdir> && sbatch --array=0-$((NCHUNKS-1)) submit_detect.slurm
+# Manual:  cd <jobdir> && sbatch --array=0-$((NCHUNKS-1)) -p batch submit_detect.slurm
 # ----------------------------------------------------------------------------
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR}"
@@ -28,15 +31,16 @@ if [ "${COLLOID_ENV_READY:-0}" != "1" ]; then
   exit 1
 fi
 
-read FRAME_START FRAME_END CHUNK_SIZE VIDEO DFS < <(python - <<'PY'
+read FRAME_START FRAME_END CHUNK_SIZE VIDEO DFS GPU < <(python - <<'PY'
 import json
 j=json.load(open("job.json"))
 print(j["frame_start"], j["frame_end"], j["chunk_size"], j["video"],
-      "1" if j.get("decode_from_start") else "0")
+      "1" if j.get("decode_from_start") else "0",
+      "1" if j.get("gpu") else "0")
 PY
 )
-DFS_FLAG=""
-if [ "$DFS" = "1" ]; then DFS_FLAG="--decode-from-start"; fi
+DFS_FLAG=""; if [ "$DFS" = "1" ]; then DFS_FLAG="--decode-from-start"; fi
+GPU_FLAG="";  if [ "$GPU" = "1" ]; then GPU_FLAG="--gpu"; fi
 
 TASK=${SLURM_ARRAY_TASK_ID:-0}
 S=$(( FRAME_START + TASK * CHUNK_SIZE ))
@@ -53,4 +57,4 @@ python detect_worker.py \
      --params job.json \
      --frames "${S}:${E}" \
      --out "$OUT" \
-     --gpu $DFS_FLAG
+     $GPU_FLAG $DFS_FLAG
