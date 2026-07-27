@@ -26,7 +26,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SHIP = ["detect_worker.py", "merge_chunks.py",
         "submit_detect.slurm", "merge.slurm", "env.sh"]
-CORE = "colloid_detect.py"          # shared detection core, lives one dir up
+CORES = ["colloid_detect.py",       # shared detection core (one dir up)
+         "colloid_analysis.py"]      # structural analysis (for --analyze observables)
 
 
 def sh(cmd, **kw):
@@ -115,6 +116,12 @@ def main():
     ap.add_argument("--max-array", type=int, default=1001,
                     help="cluster MaxArraySize (default Slurm value); the run refuses to submit "
                          "more tasks than this — raise --chunk-size instead.")
+    ap.add_argument("--no-analyze", dest="analyze", action="store_false",
+                    help="skip per-frame structural observables. By default the cluster also "
+                         "computes hexatic psi6 / defect fraction / 5-7 / boundary counts per "
+                         "frame (parallel, cheap) and returns observables.parquet for the "
+                         "whole-run graphs, so the desktop never recomputes them.")
+    ap.set_defaults(analyze=True)
     ap.add_argument("--roi", default=None,
                     help="JSON file with a drawn ROI polygon (from the app's File -> "
                          "'Export ROI for cluster…'). Confines cluster detection to that region, "
@@ -124,11 +131,11 @@ def main():
     video = Path(args.video)
     if not video.exists():
         sys.exit(f"ERROR: video not found: {video}")
-    core = HERE.parent / CORE
-    if not core.exists():
-        sys.exit(f"ERROR: {CORE} not found next to the app ({core}). "
-                 "It is created by splitting the detection core out of colloid_app.py — "
-                 "run the desktop app once after updating, or copy it here.")
+    cores = [HERE.parent / c for c in CORES]
+    for c in cores:
+        if not c.exists():
+            sys.exit(f"ERROR: {c.name} not found next to the app ({c}). "
+                     "It ships with the desktop app; copy it here or run the app once.")
     with open(args.params) as f:
         params = json.load(f)
     params = params.get("params", params)          # accept a full settings file too
@@ -190,6 +197,7 @@ def main():
         "chunk_size": args.chunk_size, "n_chunks": nchunks,
         "decode_from_start": bool(args.decode_from_start),
         "gpu": bool(args.gpu),
+        "analyze": bool(args.analyze),
         "created": ts, "schema_version": 1,
     }
     local_job = HERE / f"job_{jobname}.json"
@@ -206,7 +214,8 @@ def main():
     ssh(args.host, args.user, f"mkdir -p {rq_dir}/logs {rq_dir}/chunks")
     for fn in SHIP:
         scp(HERE / fn, args.host, args.user, f"{remote_dir}/{fn}")
-    scp(core, args.host, args.user, f"{remote_dir}/{CORE}")
+    for c in cores:
+        scp(c, args.host, args.user, f"{remote_dir}/{c.name}")
     scp(local_job, args.host, args.user, f"{remote_dir}/job.json")
     scp(video, args.host, args.user, f"{remote_dir}/{video.name}")
 
@@ -348,6 +357,9 @@ def main():
     rdir.mkdir(parents=True, exist_ok=True)
     for fn in ("detections.parquet", "job_meta.json"):
         scp_from(args.host, args.user, f"{remote_dir}/{fn}", rdir / fn)
+    if args.analyze:      # tiny per-frame observables (whole-run graphs)
+        scp_from(args.host, args.user, f"{remote_dir}/observables.parquet",
+                 rdir / "observables.parquet")
 
     print(f"\nDONE. Bundle: {rdir}")
     print("Open the desktop app -> File -> Load cluster detections… and pick "

@@ -822,6 +822,11 @@ class AnalysisData:
         self.flag_events: list = []
         self.n_pairs_series: list = []
         self.n_lagb_series: list = []
+        # Whole-run per-frame observables computed on the cluster (Oscar
+        # --analyze): DataFrame[frame, n_particles, mean_psi6, frac_defect,
+        # n_57, n_lagb] or None. Drives the defect/hexatic plot over the full
+        # run even when only a frame subset was loaded for detailed analysis.
+        self.cluster_obs = None
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2180,10 +2185,12 @@ class ClusterLoadWorker(QThread):
     finished   = pyqtSignal(object)
     error      = pyqtSignal(str)
 
-    def __init__(self, meta_path, video_path, parent=None):
+    def __init__(self, meta_path, video_path, frame_lo=None, frame_hi=None, parent=None):
         super().__init__(parent)
         self._meta_path  = Path(meta_path)
         self._video_path = Path(video_path)
+        self._frame_lo   = frame_lo     # None = from bundle
+        self._frame_hi   = frame_hi
         self._abort = False
     def abort(self): self._abort = True
 
@@ -2207,10 +2214,31 @@ class ClusterLoadWorker(QThread):
             fps = float(meta.get("fps", 0) or 0)
             data.dt_eff = (1.0 / fps) if fps > 0 else 1.0
             if float(p.get("dt", 0)) > 0: data.dt_eff = float(p["dt"])
-            data.start_fr = int(meta.get("frame_start", int(feats.frame.min())))
-            data.end_fr   = int(meta.get("frame_end",   int(feats.frame.max())))
-            s, e = data.start_fr, data.end_fr
+            full_lo = int(meta.get("frame_start", int(feats.frame.min())))
+            full_hi = int(meta.get("frame_end",   int(feats.frame.max())))
+            # Optional frame-range subset: analyse only a window of a long run so
+            # the (heavy) local linking + per-frame analysis stays tractable. The
+            # whole-run summary graphs still come from observables.parquet below.
+            s = full_lo if self._frame_lo is None else max(full_lo, int(self._frame_lo))
+            e = full_hi if self._frame_hi is None else min(full_hi, int(self._frame_hi))
+            if s > e:
+                raise RuntimeError(f"empty frame range {s}..{e} (bundle covers {full_lo}..{full_hi})")
+            if (s, e) != (full_lo, full_hi):
+                feats = feats[(feats.frame >= s) & (feats.frame <= e)].copy()
+                self.progress.emit(4, f"Frame subset {s}..{e} of {full_lo}..{full_hi}")
+            data.start_fr, data.end_fr = s, e
             nfr = e - s + 1
+
+            # Whole-run per-frame observables computed on the cluster (psi6 /
+            # defect / 5-7 / boundary counts). Loaded straight into the defect
+            # plot for the FULL run — no local per-frame recompute needed.
+            obs_path = self._meta_path.with_name("observables.parquet")
+            data.cluster_obs = None
+            if obs_path.exists():
+                try:
+                    data.cluster_obs = pd.read_parquet(obs_path)
+                except Exception:
+                    data.cluster_obs = None
 
             # ── edge filter + unit conversion (mirrors TrackingWorker) ──
             # The worker emitted RAW detections, so the edge filter is applied
@@ -4448,10 +4476,17 @@ class DefectPlot(QWidget):
             lines.append(l2); labels.append("LAGBs")
         if self._defect_df is not None and not self._defect_df.empty:
             df = self._defect_df.sort_values("frame")
-            l3,=self.ax2.plot(df["frame"],df["frac_defect"],lw=1,color="#ffaa33",ls="-",label="Defect frac")
-            l4,=self.ax2.plot(df["frame"],df["frac_5fold"],lw=1,color="#ff6644",ls="--",label="5-fold frac")
-            l5,=self.ax2.plot(df["frame"],df["frac_7fold"],lw=1,color="#4488ff",ls="--",label="7-fold frac")
-            lines += [l3,l4,l5]; labels += ["Defect frac","5-fold frac","7-fold frac"]
+            # Columns present depend on the source: local analysis gives
+            # frac_defect/5fold/7fold; cluster observables give frac_defect +
+            # mean_psi6 (hexatic order). Plot whatever is available.
+            for col, colr, style, lbl in (
+                    ("frac_defect", "#ffaa33", "-",  "Defect frac"),
+                    ("frac_5fold",  "#ff6644", "--", "5-fold frac"),
+                    ("frac_7fold",  "#4488ff", "--", "7-fold frac"),
+                    ("mean_psi6",   "#66ff99", "-",  "|ψ6| (hexatic)")):
+                if col in df.columns:
+                    ln, = self.ax2.plot(df["frame"], df[col], lw=1, color=colr, ls=style, label=lbl)
+                    lines.append(ln); labels.append(lbl)
         self.ax.set_xlabel("Frame",color="#aaa")
         self.ax.set_ylabel("Count",color="#aaa")
         self.ax2.set_ylabel("Fraction",color="#aaa")
@@ -7235,6 +7270,32 @@ class MainWindow(QMainWindow):
             if not vp: return
             video = Path(vp)
 
+        # Frame range: a long run (100k+ frames) is too heavy to link + analyse
+        # in full locally. Offer to load a window; the whole-run summary graphs
+        # still come from the cluster observables. Default = the whole bundle.
+        flo = int(meta.get("frame_start", 0))
+        fhi = int(meta.get("frame_end", 0))
+        frame_lo = frame_hi = None
+        if fhi - flo > 20000:      # only prompt for genuinely large runs
+            span = fhi - flo + 1
+            txt, ok = QInputDialog.getText(
+                self, "Frame range",
+                f"This run covers frames {flo}–{fhi} ({span:,} frames). Linking and "
+                f"per-frame analysis of all of them locally is heavy.\n\n"
+                f"Enter a frame range to load (e.g. \"{max(flo, fhi-9999)}-{fhi}\" for the "
+                f"last 10k), or leave as \"all\" for the whole run:",
+                text="all")
+            if not ok:
+                return
+            t = txt.strip().lower()
+            if t and t != "all":
+                try:
+                    lo_s, hi_s = t.replace(" ", "").split("-")
+                    frame_lo, frame_hi = int(lo_s), int(hi_s)
+                except Exception:
+                    QMessageBox.warning(self, "Bad range",
+                                        "Use START-END (e.g. 178000-188000), or 'all'."); return
+
         # Reflect the bundle's detection params in the UI so downstream recompute
         # (g(r) etc.) uses the same px_um / parameters the cluster run used.
         try:
@@ -7243,7 +7304,7 @@ class MainWindow(QMainWindow):
             pass
         # Open the video so playback + overlays work, then run the pipeline.
         self._open(video)
-        self._worker = ClusterLoadWorker(mp, video, self)
+        self._worker = ClusterLoadWorker(mp, video, frame_lo, frame_hi, self)
         self._worker.progress.connect(self._on_prog)
         self._worker.frame_done.connect(self._on_fr_done)
         self._worker.finished.connect(self._on_done)
@@ -7589,8 +7650,19 @@ class MainWindow(QMainWindow):
         self._data=data
         self.vid_pane.set_analysis(data)
         self.log_table.populate(data.flag_events)
-        defect_df = _defect_concentration_series(data.frame_results)
-        self.defect_plot.set_series(data.n_pairs_series,data.n_lagb_series,defect_df)
+        obs = getattr(data, "cluster_obs", None)
+        if obs is not None and not obs.empty:
+            # Whole-run graphs straight from the cluster observables (psi6 /
+            # defect / 5-7 / boundaries over EVERY frame), independent of the
+            # frame subset loaded for detailed analysis.
+            o = obs.sort_values("frame")
+            n_pairs = list(zip(o["frame"].tolist(), o["n_57"].tolist()))
+            n_lagb  = list(zip(o["frame"].tolist(), o["n_lagb"].tolist()))
+            ddf = o[["frame", "frac_defect", "mean_psi6"]].copy()
+            self.defect_plot.set_series(n_pairs, n_lagb, ddf)
+        else:
+            defect_df = _defect_concentration_series(data.frame_results)
+            self.defect_plot.set_series(data.n_pairs_series,data.n_lagb_series,defect_df)
         self.prog.setValue(100)
         self.btn_track.setEnabled(True); self.btn_stop.setEnabled(False)
         self.btn_export.setEnabled(True); self._a_export.setEnabled(True)

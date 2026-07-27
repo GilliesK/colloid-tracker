@@ -30,4 +30,5 @@ if [ "${COLLOID_ENV_READY:-0}" != "1" ]; then
 fi
 
 python merge_chunks.py --chunks-dir chunks --job job.json \
-       --out detections.parquet --meta-out job_meta.json
+       --out detections.parquet --meta-out job_meta.json \
+       --obs-dir obs --obs-out observables.parquet

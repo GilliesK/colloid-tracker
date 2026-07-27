@@ -22,6 +22,8 @@ def main():
     ap.add_argument("--job", required=True, help="job.json produced by the launcher")
     ap.add_argument("--out", required=True, help="output detections.parquet")
     ap.add_argument("--meta-out", required=True, help="output job_meta.json")
+    ap.add_argument("--obs-dir", default=None, help="dir holding obs_*.parquet (optional)")
+    ap.add_argument("--obs-out", default=None, help="output observables.parquet (optional)")
     args = ap.parse_args()
 
     with open(args.job) as f:
@@ -86,6 +88,19 @@ def main():
     })
     with open(args.meta_out, "w") as f:
         json.dump(meta, f, indent=2)
+
+    # ---- optional: merge per-frame observables (one row/frame — small) ----
+    if args.obs_dir and args.obs_out:
+        obs_files = sorted(glob.glob(os.path.join(args.obs_dir, "obs_*.parquet")))
+        if obs_files:
+            import pyarrow as pa
+            tables = [pq.read_table(f) for f in obs_files]
+            obs = pa.concat_tables(tables)
+            # frames are contiguous per chunk in filename order, so already sorted
+            pq.write_table(obs, args.obs_out)
+            print(f"  observables: {obs.num_rows:,} frame rows -> {args.obs_out}")
+        else:
+            print("  observables: none found (job ran without --analyze?)")
 
     print(f"merged {len(files)} chunks -> {args.out}")
     print(f"  {total_rows:,} detections over {len(frames_seen):,}/{len(expected):,} frames")

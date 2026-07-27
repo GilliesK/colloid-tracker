@@ -21,7 +21,7 @@
 # ----------------------------------------------------------------------------
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR}"
-mkdir -p logs chunks
+mkdir -p logs chunks obs
 
 # Activate the Python environment (edit oscar/env.sh — one place for both jobs).
 source "${SLURM_SUBMIT_DIR}/env.sh"
@@ -51,10 +51,12 @@ if [ "$S" -gt "$FRAME_END" ]; then
 fi
 
 OUT=$(printf "chunks/chunk_%05d.parquet" "$TASK")
+OBS=$(printf "obs/obs_%05d.parquet" "$TASK")
 echo "task $TASK -> frames $S..$E -> $OUT"
 python detect_worker.py \
      --video "$VIDEO" \
      --params job.json \
      --frames "${S}:${E}" \
      --out "$OUT" \
+     --obs-out "$OBS" \
      $GPU_FLAG $DFS_FLAG

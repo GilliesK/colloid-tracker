@@ -25,9 +25,10 @@ same Qt-free core, `colloid_detect.py`.
 
 | Stage | Where | Code |
 |---|---|---|
-| Preprocess + Crocker–Grier detection (ring / dark / plain) | **Oscar**, GPU array | `detect_worker.py` → `colloid_detect.py` |
-| Merge chunks → one coordinate table | **Oscar compute node** (dependent Slurm job) | `merge.slurm` → `merge_chunks.py` |
-| Edge filter, linking, ψ₆/g(r)/LAGB, playback | **Local** | the app's existing pipeline |
+| Preprocess + Crocker–Grier detection (ring / dark / plain) | **Oscar** array (CPU default) | `detect_worker.py` → `colloid_detect.py` |
+| Per-frame ψ₆ / defect / 5-7 / boundary counts (`--analyze`) | **Oscar** array | `detect_worker.py` → `colloid_analysis.py` |
+| Merge chunks → coordinates + observables | **Oscar compute node** (dependent Slurm job) | `merge.slurm` → `merge_chunks.py` |
+| Linking, g(r), overlays, playback (a frame window) | **Local** | the app's existing pipeline |
 
 Only coordinates come back (a few MB), never the video — the app already has it.
 
@@ -138,8 +139,19 @@ send the (CPU-only, GPU-free) merge to a batch partition.
 
 In the desktop app: **File → Load cluster detections…**, pick the fetched
 `job_meta.json` (with the original video present locally). The app rebuilds
-tracks and every observable from the cluster coordinates and populates the
-Video Analysis tab — playback, overlays, plots, and CSV export all work.
+tracks from the cluster coordinates and populates the Video Analysis tab —
+playback, overlays, plots, and CSV export all work.
+
+**Frame range.** For a long run the app first asks for a frame window to load
+(default = the whole run). Linking + per-frame analysis of 100k+ frames locally
+is heavy, so you can load, say, just the last 10k for detailed inspection.
+
+**Whole-run graphs come from the cluster.** With `--analyze` (default), the
+cluster computes per-frame **hexatic ψ₆, defect fraction, 5-7 pair count, and
+boundary count** in parallel and returns them as `observables.parquet`. The
+defect/hexatic plot is populated from that over the **entire** run — even if you
+only loaded a frame subset — with no heavy local recompute. Pass `--no-analyze`
+to skip it.
 
 ## Manual fallback (no launcher)
 
@@ -176,5 +188,8 @@ Do **not** run `python merge_chunks.py` directly on the login node — submit
   already in `--params`; omit it for full-frame detection.
 - **Result format** (`schema_version: 1`): `detections.parquet` columns
   `frame,x,y,mass,ecc,signal` (float32, original-resolution px, 0-based absolute
-  frame index); `job_meta.json` carries video name, W/H, fps, the full param dict,
-  and completion stats.
+  frame index); `observables.parquet` (when `--analyze`) columns
+  `frame,n_particles,mean_psi6,frac_defect,n_57,n_lagb` (one row per frame);
+  `job_meta.json` carries video name, W/H, fps, the full param dict, and
+  completion stats. Observables are computed on the edge-filtered detections, so
+  they match a local `analyze_frame` exactly (verified byte-for-byte).

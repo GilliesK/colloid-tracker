@@ -38,6 +38,40 @@ except Exception as exc:                       # pragma: no cover
         f"  {exc}\n")
     raise
 
+# Structural analysis (hexatic psi6 / defects / boundaries). Optional: only
+# needed when the job requests per-frame observables (--analyze). Qt-free,
+# depends only on numpy/scipy/pandas (already in the env).
+try:
+    import colloid_analysis as CA
+except Exception:                              # pragma: no cover
+    CA = None
+
+# Analysis-param fallbacks (mirror colloid_app._DEFAULT_PARAMS) for any key a
+# minimal exported params.json omits.
+_ANALYSIS_DEFAULTS = {"pair_dist_px": 48.0, "lagb_eps_px": 96.0, "lagb_min_n": 3,
+                      "lagb_aspect": 2.0, "lagb_angle_deg": 15.0}
+
+
+def frame_observables(feats, fr, p, W, H):
+    """Per-frame structural summary, computed on the cluster so the desktop never
+    re-runs it: edge-filter the detections (matching the local pipeline), run
+    analyze_frame, and reduce to one row. Returns
+    (frame, n_particles, mean_psi6, frac_defect, n_57, n_boundaries)."""
+    edge = int(p.get("edge_px", 38))
+    m = ((feats.x >= edge) & (feats.x <= W - 1 - edge) &
+         (feats.y >= edge) & (feats.y <= H - 1 - edge))
+    pts = feats.loc[m, ["x", "y"]].to_numpy()
+    if len(pts) < 4:
+        return (int(fr), int(len(pts)), float("nan"), float("nan"), 0, 0)
+    dp = {k: p.get(k, _ANALYSIS_DEFAULTS[k]) for k in _ANALYSIS_DEFAULTS}
+    dp["px_um"] = float(p.get("px_um", 0.11))
+    dp["max_neighbor_dist_um"] = p.get("max_neighbor_dist_um", 0.0)
+    res = CA.analyze_frame(pts, dp)
+    mean_psi6 = float(np.mean(np.abs(res.psi6))) if len(res.psi6) else float("nan")
+    frac_defect = float(np.mean(res.coord != 6)) if len(res.coord) else float("nan")
+    return (int(fr), int(len(pts)), mean_psi6, frac_defect,
+            int(len(res.pairs57)), int(len(res.boundaries)))
+
 
 def _roi_mask_from_polygon(poly, H, W):
     """Boolean detection mask from a [[x,y],...] polygon (or None -> full frame).
@@ -112,6 +146,9 @@ def main():
     ap.add_argument("--params", required=True, help="job.json holding the detection param dict")
     ap.add_argument("--frames", required=True, help="START:END inclusive, 0-based absolute frame index")
     ap.add_argument("--out", required=True, help="output .parquet chunk path")
+    ap.add_argument("--obs-out", default=None,
+                    help="output per-frame observables .parquet (written when the job has "
+                         "\"analyze\": true and colloid_analysis is importable)")
     ap.add_argument("--gpu", action="store_true",
                     help="advisory: cupy is used automatically if importable; this just logs intent")
     ap.add_argument("--decode-from-start", action="store_true",
@@ -123,6 +160,12 @@ def main():
         job = json.load(f)
     p = job["params"] if "params" in job else job     # accept bare param dict too
     s, e = (int(v) for v in args.frames.split(":"))
+
+    analyze = bool(job.get("analyze")) and args.obs_out is not None
+    if analyze and CA is None:
+        sys.stderr.write("[worker] WARNING: analyze requested but colloid_analysis "
+                         "not importable — skipping observables (detection still runs).\n")
+        analyze = False
 
     cap = cv2.VideoCapture(args.video, cv2.CAP_FFMPEG)
     if not cap.isOpened():
@@ -169,7 +212,7 @@ def main():
         else:
             cur = s
 
-    frames_out, t0, ndet = [], time.time(), 0
+    frames_out, obs_out, t0, ndet = [], [], time.time(), 0
     fr = cur
     while fr <= e:
         ok, bgr = cap.read()
@@ -182,12 +225,30 @@ def main():
             df.insert(0, "frame", np.int32(fr))
             frames_out.append(df)
             ndet += len(df)
+            if analyze:
+                obs_out.append(frame_observables(feats, fr, p, W, H))
+        elif analyze:
+            obs_out.append((int(fr), 0, float("nan"), float("nan"), 0, 0))
         if (fr - s) % 50 == 0:
             rate = (fr - s + 1) / max(1e-9, time.time() - t0)
             sys.stderr.write(f"[worker] frame {fr} ({rate:.1f} fps, {ndet} dets)\n")
             sys.stderr.flush()
         fr += 1
     cap.release()
+
+    if analyze:
+        cols = ["frame", "n_particles", "mean_psi6", "frac_defect", "n_57", "n_lagb"]
+        obs = pd.DataFrame(obs_out, columns=cols) if obs_out else \
+            pd.DataFrame({c: pd.Series(dtype="float32" if c in ("mean_psi6", "frac_defect")
+                                       else "int32") for c in cols})
+        obs["frame"] = obs["frame"].astype("int32")
+        for c in ("n_particles", "n_57", "n_lagb"):
+            obs[c] = obs[c].astype("int32")
+        for c in ("mean_psi6", "frac_defect"):
+            obs[c] = obs[c].astype("float32")
+        os.makedirs(os.path.dirname(os.path.abspath(args.obs_out)) or ".", exist_ok=True)
+        obs.to_parquet(args.obs_out, index=False)
+        sys.stderr.write(f"[worker] wrote {len(obs)} observable rows -> {args.obs_out}\n")
 
     if frames_out:
         out = pd.concat(frames_out, ignore_index=True)
