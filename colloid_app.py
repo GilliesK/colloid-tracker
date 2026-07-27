@@ -4830,10 +4830,16 @@ class DiagnosticsPanel(QWidget):
         okc = np.isfinite(st["C_par_um2"]) & (st["x_um"] > 0)
         axB.semilogx(st["x_um"][okc], st["C_par_um2"][okc], ".-", ms=3, lw=0.8,
                      color="#dd44dd", label="C∥ (climb)")
+        # Fitted A + κ·ln(x) over the D ≤ x ≤ L/3 window (the depinning test):
+        # a rising line = depinned (κ > 0), flat = pinned.
+        fx, fy = st.get("B_perp_fit_x"), st.get("B_perp_fit_y")
+        if fx is not None and len(fx):
+            axB.semilogx(fx, fy, "-", lw=1.3, color="#ffffff", alpha=0.85,
+                         label=f"fit κ={st['B_perp_logslope_um2']:.2e}")
         axB.set_xlabel("x [µm]"); axB.set_ylabel("⟨Δ²⟩ [µm²]")
         axB.legend(fontsize=6, frameon=False, labelcolor="#aaa")
-        axB.set_title("Fluctuations (pinned: flat · depinned: ∝ ln x)",
-                      fontsize=7, color="#aaa")
+        axB.set_title("Transverse fluctuation B⊥(x) + A+κ·ln x fit "
+                      "(pinned κ≈0 · depinned κ>0)", fontsize=7, color="#aaa")
         # S(q) with G_m markers and fitted η_m
         G1 = st["G1_um_inv"]
         axS.semilogy(st["q_um_inv"] / G1, np.maximum(st["S_q"], 1e-3),
@@ -4865,6 +4871,10 @@ class DiagnosticsPanel(QWidget):
             f"θ (grain ψ₆ bands)  = {st.get('theta_grains_deg', float('nan')):.2f}°",
             f"θ (Frank, b/D)      = {st['theta_frank_deg']:.2f}°",
             f"θ (5-7 core pairs)  = {st['theta_psi6_deg']:.2f}°  (biased low)",
+            f"κ (B⊥ log-slope) = {st.get('B_perp_logslope_um2', float('nan')):.2e}"
+            f" ± {st.get('B_perp_logslope_err', float('nan')):.1e} µm²",
+            f"→ phase: {st.get('phase', 'indeterminate').upper()}"
+            f"   (fit {st.get('B_perp_fit_nbins', 0)} bins, D≤x≤L/3)",
             f"η_m fits: " + ", ".join(
                 f"η{m}={e:.2f}" if np.isfinite(e) else f"η{m}=–"
                 for m, e in enumerate(st["eta_m"], 1)),
@@ -7588,6 +7598,7 @@ class MainWindow(QMainWindow):
         self._settings.set_export_dir(str(Path(path).parent)); self._settings.save()
         base = str(Path(path).with_suffix(""))
         pd.DataFrame({"x_um": st["x_um"], "B_perp_um2": st["B_perp_um2"],
+                      "B_perp_count": st.get("B_perp_count", np.full(len(st["x_um"]), np.nan)),
                       "C_par_um2": st["C_par_um2"]}).to_csv(base + "_fluct.csv", index=False)
         pd.DataFrame({"q_um_inv": st["q_um_inv"], "S_q": st["S_q"]}
                      ).to_csv(base + "_sq.csv", index=False)
@@ -7596,7 +7607,10 @@ class MainWindow(QMainWindow):
         summary = {k: st.get(k) for k in ("gb_id", "n_frames", "n_dislocations",
                                           "D_um", "b_um", "L_um", "theta_grains_deg",
                                           "theta_frank_deg", "theta_psi6_deg",
-                                          "G1_um_inv", "dq_res_um_inv")}
+                                          "G1_um_inv", "dq_res_um_inv",
+                                          "B_perp_logslope_um2", "B_perp_logslope_err",
+                                          "B_perp_fit_intercept_um2", "B_perp_fit_nbins",
+                                          "phase", "kappa_theory_um2")}
         for m, e in enumerate(st["eta_m"], 1):
             summary[f"eta_{m}"] = e
         pd.DataFrame([summary]).to_csv(base + "_summary.csv", index=False)

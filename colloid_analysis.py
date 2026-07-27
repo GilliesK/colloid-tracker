@@ -602,6 +602,70 @@ def _collapse_cores(s: np.ndarray, h: np.ndarray, core_px: float):
     return s_out, h_out
 
 
+def _empty_bperp_fit() -> dict:
+    return {"B_perp_logslope_um2": float("nan"), "B_perp_logslope_err": float("nan"),
+            "B_perp_fit_intercept_um2": float("nan"),
+            "B_perp_fit_x": np.array([]), "B_perp_fit_y": np.array([]),
+            "B_perp_fit_nbins": 0, "phase": "indeterminate",
+            "kappa_theory_um2": float("nan")}
+
+
+def _fit_bperp_logslope(x_um, B_perp_um2, B_perp_count, D_um, L_um, b_um,
+                        x_lo_factor: float = 1.0, x_hi_frac: float = 1.0 / 3.0,
+                        min_bins: int = 4, min_count_per_bin: int = 20,
+                        n_sigma: float = 2.0, kappa_floor_frac: float = 0.05) -> dict:
+    """Weighted  B⊥(x) = A + κ·ln(x)  fit + pinned/depinned classification.
+
+    Zhang–Nelson (arXiv:2009.03408): a DEPINNED low-angle grain boundary has
+    B⊥(x) → (8/π)·k_BT·D²/(Y b²)·ln x for D ≪ x ≪ L, while a PINNED one saturates
+    (flat). We fit the log-slope κ over D ≤ x ≤ L/3 — excluding sub-spacing
+    discreteness (x ≲ D) and finite-length saturation / sparse tail bins (x ≳
+    L/3) — weighted by the per-bin pair counts, with a reduced-χ² slope error.
+
+    Reuses the already-binned B⊥/counts, so it is O(nbins) — no re-pairing.
+    Returns NaN/empty when under-determined. The thresholds (n_sigma,
+    kappa_floor_frac, x-window) are heuristic; tune on known pinned/depinned data.
+    κ_theory is left NaN — the app has no 2D Young's modulus / temperature
+    calibration, so a theory comparison is out of scope here (κ ± σκ and the
+    phase verdict are the self-contained result)."""
+    if not (np.isfinite(D_um) and np.isfinite(L_um) and D_um > 0 and L_um > 0):
+        return _empty_bperp_fit()
+    x = np.asarray(x_um, float); y = np.asarray(B_perp_um2, float)
+    c = (np.asarray(B_perp_count, float) if B_perp_count is not None
+         else np.ones_like(x))
+    m = ((x >= x_lo_factor * D_um) & (x <= x_hi_frac * L_um) & (x > 0)
+         & np.isfinite(y) & (c >= min_count_per_bin))
+    N = int(m.sum())
+    if N < min_bins:
+        return _empty_bperp_fit()
+    t = np.log(x[m]); yy = y[m]; w = c[m]
+    Sw = w.sum(); Swt = (w * t).sum(); Swtt = (w * t * t).sum()
+    Swy = (w * yy).sum(); Swty = (w * t * yy).sum()
+    Delta = Sw * Swtt - Swt * Swt
+    if Delta <= 0 or N < 3:
+        return _empty_bperp_fit()
+    kappa = (Sw * Swty - Swt * Swy) / Delta
+    A = (Swtt * Swy - Swt * Swty) / Delta
+    r = yy - (A + kappa * t)
+    # bin counts are RELATIVE weights, so scale the covariance by the reduced-χ²
+    # unit-weight variance estimate to get an absolute slope uncertainty.
+    s2 = float((w * r * r).sum() / (N - 2))
+    sig_k = float(np.sqrt(max(s2 * Sw / Delta, 0.0)))
+    kfloor = kappa_floor_frac * (b_um ** 2) if np.isfinite(b_um) else 0.0
+    if (kappa > n_sigma * sig_k) and (kappa > kfloor):
+        phase = "depinned"
+    elif abs(kappa) <= n_sigma * sig_k:
+        phase = "pinned"
+    else:
+        phase = "indeterminate"      # e.g. a significant NEGATIVE slope
+    fx = x[m]
+    return {"B_perp_logslope_um2": float(kappa), "B_perp_logslope_err": sig_k,
+            "B_perp_fit_intercept_um2": float(A),
+            "B_perp_fit_x": fx, "B_perp_fit_y": A + kappa * np.log(fx),
+            "B_perp_fit_nbins": N, "phase": phase,
+            "kappa_theory_um2": float("nan")}
+
+
 def lagb_statistics(snapshots: list, px_um: float,
                     nn_spacing_px: float = float("nan"),
                     n_q: int = 1600, m_max: int = 3,
@@ -643,6 +707,10 @@ def lagb_statistics(snapshots: list, px_um: float,
         mis.append(bd.get("misorientation_deg", np.nan))
     all_sp = np.concatenate(spacings) if spacings else np.array([np.nan])
     D = float(np.median(all_sp))                       # µm
+    # Assign these BEFORE the degenerate guard — the guard's return references
+    # them (a latent NameError if that branch was ever taken).
+    theta_psi6 = float(np.nanmean(mis))                # degrees
+    b_um = nn_spacing_px * px_um
     if not np.isfinite(D) or D <= 0:
         # Degenerate boundary (e.g. every member collapsed into one core —
         # can only happen when D ≲ 2b, i.e. not actually a LOW-angle GB).
@@ -653,12 +721,11 @@ def lagb_statistics(snapshots: list, px_um: float,
                 "D_um": float("nan"), "L_um": float("nan"), "b_um": float(b_um),
                 "theta_psi6_deg": theta_psi6, "theta_frank_deg": float("nan"),
                 "theta_grains_deg": float("nan"),
-                "x_um": empty, "B_perp_um2": empty, "C_par_um2": empty,
+                "x_um": empty, "B_perp_um2": empty, "B_perp_count": empty,
+                "C_par_um2": empty,
                 "q_um_inv": empty, "S_q": empty, "G1_um_inv": float("nan"),
                 "eta_m": [float("nan")] * m_max, "dq_res_um_inv": float("nan"),
-                "spacings_norm": empty}
-    theta_psi6 = float(np.nanmean(mis))                # degrees
-    b_um = nn_spacing_px * px_um
+                "spacings_norm": empty, **_empty_bperp_fit()}
     theta_frank = float(np.degrees(b_um / D)) if D > 0 and np.isfinite(b_um) else float("nan")
 
     # ── pairwise fluctuation correlations, binned by separation ────────
@@ -720,10 +787,12 @@ def lagb_statistics(snapshots: list, px_um: float,
         "D_um": D, "L_um": L, "b_um": float(b_um),
         "theta_psi6_deg": theta_psi6, "theta_frank_deg": theta_frank,
         "theta_grains_deg": theta_grains,
-        "x_um": x_centers, "B_perp_um2": B_perp, "C_par_um2": C_par,
+        "x_um": x_centers, "B_perp_um2": B_perp, "B_perp_count": bcnt,
+        "C_par_um2": C_par,
         "q_um_inv": q, "S_q": S, "G1_um_inv": float(G1),
         "eta_m": etas, "dq_res_um_inv": float(dq_res),
         "spacings_norm": (all_sp / D) if D > 0 else all_sp,
+        **_fit_bperp_logslope(x_centers, B_perp, bcnt, D, L, b_um),
     }
 
 
