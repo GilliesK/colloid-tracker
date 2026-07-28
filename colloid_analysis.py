@@ -602,6 +602,35 @@ def _collapse_cores(s: np.ndarray, h: np.ndarray, core_px: float):
     return s_out, h_out
 
 
+def is_ideal_lagb(bd: dict, b_px: float, theta_min: float = 2.0,
+                  theta_max: float = 12.0, min_disloc: int = 6) -> bool:
+    """True only for a boundary worth a Zhang–Nelson transverse-fluctuation
+    measurement: a symmetric-tilt misorientation in the LOW-angle window
+    [theta_min, theta_max], with at least `min_disloc` DISTINCT dislocations
+    spread along the line.
+
+    The distinct-core count (members collapsed within 2 lattice constants)
+    is the key discriminator: it rejects the compact dislocation clusters and
+    crystal-edge tangles — which have many raw 5-7 pairs bunched into ~1 core —
+    that the plain LAGB detector otherwise flags. Only an EXTENDED Frank array
+    (dislocations genuinely spaced ~D apart over the boundary) survives, which
+    is exactly the object B⊥(x) needs. HAGBs (theta>theta_max) and one-sided
+    crystal edges (theta = NaN) are excluded by the angle test."""
+    th = bd.get("theta_grains_deg")
+    if th is None or not np.isfinite(th) or not (theta_min <= th <= theta_max):
+        return False
+    s = np.asarray(bd.get("s", ()), dtype=float)
+    if s.size < min_disloc:
+        return False
+    if np.isfinite(b_px) and b_px > 0:
+        h = np.asarray(bd.get("h", np.zeros_like(s)), dtype=float)
+        o = np.argsort(s)
+        s_c, _ = _collapse_cores(s[o], h[o], 2.0 * b_px)
+        if len(s_c) < min_disloc:
+            return False
+    return True
+
+
 def _empty_bperp_fit() -> dict:
     return {"B_perp_logslope_um2": float("nan"), "B_perp_logslope_err": float("nan"),
             "B_perp_fit_intercept_um2": float("nan"),

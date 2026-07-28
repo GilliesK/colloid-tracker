@@ -112,6 +112,7 @@ from colloid_analysis import (
     _pair_correlations_trajectory, _defect_concentration_series,
     analyze_frame, _affine, _cage,
     median_nn_spacing_px, track_boundaries, lagb_statistics, wigner_surmise,
+    is_ideal_lagb,
 )
 
 import matplotlib
@@ -3212,15 +3213,24 @@ class AnalysisWorker(QThread):
         # Live diagnostic overlays (mirror the playback ones in VideoPane) and
         # the grain-boundary detector switch. Set from the CameraPane's
         # "Live overlays" section via set_live_options().
+        # ideal_lagb_only: draw ONLY boundaries that pass is_ideal_lagb (an
+        # extended low-angle wall worth a B⊥ measurement); everything else —
+        # HAGBs, compact clusters, crystal edges — is hidden.
         self._live_opts      = {"ecc": False, "motion": False,
-                                "grain": False, "lagb": True}
+                                "grain": False, "lagb": True,
+                                "ideal_lagb_only": False,
+                                "ideal_theta_min": 2.0, "ideal_theta_max": 12.0,
+                                "ideal_min_disloc": 6}
         self._prev_pts       : "np.ndarray | None" = None   # for the motion overlay
 
     def set_live_options(self, **kw):
-        """Toggle live overlays / the LAGB detector. Keys: ecc, motion, grain, lagb."""
+        """Toggle live overlays / the LAGB detector + ideal-LAGB filter."""
         with self._lock:
-            self._live_opts.update({k: bool(v) for k, v in kw.items()
-                                    if k in self._live_opts})
+            for k, v in kw.items():
+                if k not in self._live_opts:
+                    continue
+                cur = self._live_opts[k]          # cast to the stored type
+                self._live_opts[k] = bool(v) if isinstance(cur, bool) else type(cur)(v)
             if "motion" in kw and not kw["motion"]:
                 self._prev_pts = None   # drop stale history so re-enabling is clean
 
@@ -3322,7 +3332,8 @@ class AnalysisWorker(QThread):
                 dp  = {
                     # Off => analyze_frame returns no boundaries, skipping the
                     # DBSCAN + grain-band misorientation passes entirely.
-                    "skip_boundaries": not opts["lagb"],
+                    # The ideal-LAGB filter needs boundaries, so it forces them on.
+                    "skip_boundaries": not (opts["lagb"] or opts["ideal_lagb_only"]),
                     "pair_dist_px":  p.get("pair_dist_px",  48)  * cam_scale,
                     "lagb_eps_px":   p.get("lagb_eps_px",   96)  * cam_scale,
                     "lagb_min_n":    p.get("lagb_min_n",     3),
@@ -3336,6 +3347,18 @@ class AnalysisWorker(QThread):
                     "max_neighbor_dist_um": p.get("max_neighbor_dist_um", 0.0),
                 }
                 res = analyze_frame(pts, dp)
+                # Ideal-LAGB filter: keep ONLY extended low-angle walls worth a
+                # B⊥ measurement; hide HAGBs, compact clusters, crystal edges.
+                # Applied before annotate + the live stats, so the overlay stays
+                # blank until a genuine measurable boundary appears, and the LAGB
+                # count reflects only ideal ones.
+                if opts.get("ideal_lagb_only") and res.boundaries:
+                    _bp = float(np.median(cKDTree(pts).query(pts, k=2)[0][:, 1])) \
+                        if len(pts) >= 2 else float("nan")
+                    res.boundaries = [b for b in res.boundaries if is_ideal_lagb(
+                        b, _bp, opts.get("ideal_theta_min", 2.0),
+                        opts.get("ideal_theta_max", 12.0),
+                        int(opts.get("ideal_min_disloc", 6)))]
                 ann = annotate(bgr, res, layer, [], 0)
                 _legend(ann, layer)
 
@@ -4420,13 +4443,66 @@ class DefectPlot(QWidget):
         self._mark_timer = QTimer(self); self._mark_timer.setSingleShot(True)
         self._mark_timer.timeout.connect(self._apply_mark)
 
+        row=QHBoxLayout()
+        row.addWidget(QLabel("Bin:"))
+        self.cmb_bin=NoScrollComboBox()
+        self.cmb_bin.addItems(["Auto","Off","250","500","1000","2000"])
+        self.cmb_bin.setToolTip(
+            "Bin the time series into frame windows (mean per window) so long runs\n"
+            "show trends instead of per-frame noise. The raw series stays as a faint\n"
+            "underlay. 'Auto' bins to ~500 points once the run is long enough; 'Off'\n"
+            "plots every frame; a number sets the target point count.")
+        self.cmb_bin.currentTextChanged.connect(lambda _:self._draw())
+        row.addWidget(self.cmb_bin); row.addStretch()
         self.btn_export=QPushButton("Export CSV…")
         self.btn_export.setToolTip(
             "Save the defect-concentration series (frame, frac_defect, frac_5fold,\n"
             "frac_7fold) to a CSV file. Enabled once tracking/analysis has completed.")
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self.export_csv_requested.emit)
-        lay.addWidget(self.btn_export)
+        row.addWidget(self.btn_export)
+        lay.addLayout(row)
+
+    def _target_bins(self) -> "int | None":
+        """Target #points from the Bin combo. None = no binning (raw)."""
+        t=self.cmb_bin.currentText()
+        if t=="Off": return None
+        if t=="Auto": return 500
+        try: return int(t)
+        except ValueError: return 500
+
+    @staticmethod
+    def _bin_xy(fr, y, nbins):
+        """Downsample (frame,value) into nbins equal-frame-width bins → (bin
+        centre frame, mean value). NaN-aware; empty bins dropped."""
+        fr=np.asarray(fr,float); y=np.asarray(y,float)
+        lo,hi=float(fr.min()),float(fr.max())
+        if hi<=lo: return fr,y
+        edges=np.linspace(lo,hi+1e-9,nbins+1)
+        centres=0.5*(edges[:-1]+edges[1:])
+        idx=np.clip(np.searchsorted(edges,fr,side="right")-1,0,nbins-1)
+        sums=np.zeros(nbins); cnts=np.zeros(nbins)
+        v=np.isfinite(y)
+        np.add.at(sums,idx[v],y[v]); np.add.at(cnts,idx[v],1)
+        keep=cnts>0
+        with np.errstate(invalid="ignore"):
+            return centres[keep], sums[keep]/cnts[keep]
+
+    def _plot_series(self, ax, fr, y, color, label, ls="-"):
+        """Plot a time series, binned to the target point count when long
+        enough — raw as a faint underlay, binned mean as the bold line."""
+        fr=np.asarray(fr,float); y=np.asarray(y,float)
+        nb=self._target_bins()
+        if nb and len(fr) > nb*2:
+            # Raw as a light noise envelope under the binned trend; fade it as the
+            # series grows so 100k+ points read as a faint band, not a solid fill.
+            a=float(np.clip(3000.0/len(fr), 0.05, 0.20))
+            ax.plot(fr,y,ls,lw=0.4,color=color,alpha=a)
+            bx,by=self._bin_xy(fr,y,nb)
+            ln,=ax.plot(bx,by,ls,lw=1.4,color=color,label=label)
+        else:
+            ln,=ax.plot(fr,y,ls,lw=1,color=color,label=label)
+        return ln
 
     def add_point(self,fr,n57,nl):
         self._b57.append((fr,n57)); self._blagb.append((fr,nl))
@@ -4468,12 +4544,10 @@ class DefectPlot(QWidget):
         lines, labels = [], []
         if self._b57:
             fr,n=zip(*sorted(self._b57))
-            l1,=self.ax.plot(fr,n,lw=1,color="#dd44dd",label="5-7 pairs")
-            lines.append(l1); labels.append("5-7 pairs")
+            lines.append(self._plot_series(self.ax,fr,n,"#dd44dd","5-7 pairs")); labels.append("5-7 pairs")
         if self._blagb:
             fr,n=zip(*sorted(self._blagb))
-            l2,=self.ax.plot(fr,n,lw=1,color="#44dddd",label="LAGBs")
-            lines.append(l2); labels.append("LAGBs")
+            lines.append(self._plot_series(self.ax,fr,n,"#44dddd","LAGBs")); labels.append("LAGBs")
         if self._defect_df is not None and not self._defect_df.empty:
             df = self._defect_df.sort_values("frame")
             # Columns present depend on the source: local analysis gives
@@ -4485,8 +4559,8 @@ class DefectPlot(QWidget):
                     ("frac_7fold",  "#4488ff", "--", "7-fold frac"),
                     ("mean_psi6",   "#66ff99", "-",  "|ψ6| (hexatic)")):
                 if col in df.columns:
-                    ln, = self.ax2.plot(df["frame"], df[col], lw=1, color=colr, ls=style, label=lbl)
-                    lines.append(ln); labels.append(lbl)
+                    lines.append(self._plot_series(self.ax2,df["frame"].values,df[col].values,colr,lbl,style))
+                    labels.append(lbl)
         self.ax.set_xlabel("Frame",color="#aaa")
         self.ax.set_ylabel("Count",color="#aaa")
         self.ax2.set_ylabel("Fraction",color="#aaa")
@@ -6043,6 +6117,39 @@ class CameraPane(QWidget):
                     self.cb_ov_grain, self.cb_ov_lagb):
             _cb.toggled.connect(lambda _v: self._push_live_overlays())
             ov_lay.addWidget(_cb)
+
+        # ── ideal-LAGB filter ─────────────────────────────────────
+        self.cb_ov_ideal = QCheckBox("Ideal LAGB only  (hide all but measurable walls)")
+        self.cb_ov_ideal.setToolTip(
+            "Show ONLY grain boundaries worth a Zhang–Nelson B⊥ measurement: a\n"
+            "symmetric-tilt misorientation in the low-angle window below, with at\n"
+            "least the minimum number of DISTINCT dislocations spread along the\n"
+            "line. HAGBs, compact dislocation clusters, and crystal edges are all\n"
+            "hidden. The overlay stays blank until such a boundary appears, and\n"
+            "the live LAGB count reflects only these. Forces the boundary detector\n"
+            "on. Use it to watch for the extended low-angle wall your experiment\n"
+            "is trying to produce, without the clutter of everything else.")
+        self.cb_ov_ideal.toggled.connect(lambda _v: self._push_live_overlays())
+        ov_lay.addWidget(self.cb_ov_ideal)
+        idl_row = QHBoxLayout()
+        idl_row.addWidget(QLabel("   θ window"))
+        self.sp_ideal_tmin = QDoubleSpinBox(); self.sp_ideal_tmin.setRange(0.0, 30.0)
+        self.sp_ideal_tmin.setValue(2.0); self.sp_ideal_tmin.setSingleStep(0.5)
+        self.sp_ideal_tmin.setDecimals(1); self.sp_ideal_tmin.setSuffix("°")
+        self.sp_ideal_tmax = QDoubleSpinBox(); self.sp_ideal_tmax.setRange(0.0, 30.0)
+        self.sp_ideal_tmax.setValue(12.0); self.sp_ideal_tmax.setSingleStep(0.5)
+        self.sp_ideal_tmax.setDecimals(1); self.sp_ideal_tmax.setSuffix("°")
+        idl_row.addWidget(self.sp_ideal_tmin); idl_row.addWidget(QLabel("–")); idl_row.addWidget(self.sp_ideal_tmax)
+        idl_row.addWidget(QLabel("  min disl."))
+        self.sp_ideal_ndis = QSpinBox(); self.sp_ideal_ndis.setRange(2, 100); self.sp_ideal_ndis.setValue(6)
+        idl_row.addWidget(self.sp_ideal_ndis); idl_row.addStretch()
+        for _w in (self.sp_ideal_tmin, self.sp_ideal_tmax, self.sp_ideal_ndis):
+            _w.setToolTip("Criteria for an 'ideal' LAGB: misorientation inside the θ window\n"
+                          "and at least this many distinct dislocations along the wall.")
+        self.sp_ideal_tmin.valueChanged.connect(lambda _v: self._push_live_overlays())
+        self.sp_ideal_tmax.valueChanged.connect(lambda _v: self._push_live_overlays())
+        self.sp_ideal_ndis.valueChanged.connect(lambda _v: self._push_live_overlays())
+        ov_lay.addLayout(idl_row)
         lay.addWidget(ov_group)
 
         drec_group = CollapsibleGroupBox("Defect density record (live)", expanded=False)
@@ -6302,7 +6409,11 @@ class CameraPane(QWidget):
                 ecc=self.cb_ov_ecc.isChecked(),
                 motion=self.cb_ov_motion.isChecked(),
                 grain=self.cb_ov_grain.isChecked(),
-                lagb=self.cb_ov_lagb.isChecked())
+                lagb=self.cb_ov_lagb.isChecked(),
+                ideal_lagb_only=self.cb_ov_ideal.isChecked(),
+                ideal_theta_min=self.sp_ideal_tmin.value(),
+                ideal_theta_max=self.sp_ideal_tmax.value(),
+                ideal_min_disloc=self.sp_ideal_ndis.value())
 
     def _stop_ana_worker(self):
         """Stop and release the AnalysisWorker thread. Waits briefly so the
